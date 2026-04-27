@@ -6,9 +6,9 @@
 #include "distribution.hpp"
 #include <fst/fstlib.h>
 #include <ngram/ngram.h>
-#include "ctrack.hpp"
+// #include "external/ctrack.hpp"
 #include "labelling.hpp"
-#include "argparse.hpp"
+#include "external/argparse.hpp"
 
 // using Eigen::MatrixXd;
 
@@ -228,7 +228,7 @@ FST align_to_fst(Form ur, Form sr) {
     return ar;
 };
 
-Form fst_to_form(FST fst) {
+Form fst_to_form(const FST& fst) {
     Form form;
 
     // fst::StdVectorFst trop_fst;
@@ -239,7 +239,8 @@ Form fst_to_form(FST fst) {
     auto state = fst.Start();
     if (state == fst::kNoStateId) return form;
 
-    while (true) {
+    // TODO: arbitrary max_length
+    for (size_t i = 0; i < 30; ++i) {
         if (fst.Final(state) != Semiring::Zero()) {
             break;
         }
@@ -257,16 +258,19 @@ Form fst_to_form(FST fst) {
 }
 
 
-void display_form(
+std::string display_form(
         Form form, Labelling<Label, Text, Text>& labelling,
         std::string lwrap="", std::string rwrap="", std::string end="\n")
 {
-    std::cout << lwrap;
+    std::string ret;
+    ret += lwrap;
     for (Label segment : form) {
         if (segment == labelling.special("epsilon")) { continue; }
-        std::cout << labelling.decode(segment);
+        std::cout << segment << ' ' << labelling.decode(segment) << '\n';
+        ret += labelling.decode(segment);
     }
-    std::cout << rwrap << end;
+    ret += rwrap + end;
+    return ret;
 }
 
 template <typename A>
@@ -330,13 +334,13 @@ fst::VectorFst<A> from_acceptor(
 // TODO: pass in phon or whatever we end up calling it for phi and epsilon
 // TODO: Universal grammar should be a simple FST
 FST ngram_counts(
-        Lexicon lexicon, NGramFST ug_model,
+        std::vector<UR> parameters, NGramFST ug_model,
         Labelling<Label, std::pair<Label, Label>, Text>& labelling,
         double ug_weight)
 {
     FST top;
 
-    for (auto [ur, _] : lexicon) {
+    for (UR ur : parameters) {
         fst::Union(&top, to_acceptor(labelling, ur));
     }
     fst::RmEpsilon(&top);
@@ -487,10 +491,10 @@ struct HashPair {
 // TODO: split Form into UR and SR forms?
 // and maybe better name SR and UR
 FST gibbs_fst_dijkstra(
-        Lexicon* lexicon,
-        int steps, double burn_in, Engine engine, std::vector<Form> surface_forms,
+        int steps, Engine engine, std::vector<Form> surface_forms,
         NGramFST ug_counts,
         Labelling<Label, std::pair<Label, Label>, Text>& alignemes,
+        Labelling<Label, Text, Text>& phonemes,
         Semiring alpha,
         double ug_weight,
         size_t rebuild_every
@@ -498,23 +502,22 @@ FST gibbs_fst_dijkstra(
 {
     using Index = int;
 
+    // TODO: this vector gets massive, probably a better way to handle it
     std::vector<FST> saved_fsts;
 
     saved_fsts.push_back(FST());
     Index ngram = saved_fsts.size() - 1;
 
     // TODO: Lexicon should be its own abstraction
-    lexicon->clear();
     std::vector<Index> observations;
-    std::vector<Index> parameters;
+    std::vector<Index> initial_parameters;
     for (Form sr : surface_forms) {
         UR ur_fst = form_to_fst(sr);
         SR sr_fst = form_to_fst(sr);
         fst::ArcSort(&ur_fst, fst::OLabelCompare<Arc>());
         fst::ArcSort(&sr_fst, fst::ILabelCompare<Arc>());
-        lexicon->push_back(std::pair(ur_fst, Semiring::Zero()));
         saved_fsts.push_back(ur_fst);
-        parameters.push_back(saved_fsts.size() - 1);
+        initial_parameters.push_back(saved_fsts.size() - 1);
         saved_fsts.push_back(sr_fst);
         observations.push_back(saved_fsts.size() - 1);
     }
@@ -551,11 +554,12 @@ FST gibbs_fst_dijkstra(
         }
         );
 
+    // TODO: lexiconmap is poorly named
     distribution::GibbsDirichletProcess<Index, Semiring, Engine, Index, Index, LexiconMap> dp(
             &prior,
             alpha,
             observations,
-            parameters,
+            initial_parameters,
             [&saved_fsts, &likelihood_cache, &ngram](Index sr, Index ur) -> Semiring {
                 if (auto it = likelihood_cache.find(std::pair(sr, ur)); it != likelihood_cache.end()) {
                     return it->second;
@@ -583,8 +587,17 @@ FST gibbs_fst_dijkstra(
             &uniform
             );
 
-    saved_fsts[ngram] = ngram_counts(*lexicon, ug_counts, alignemes, ug_weight);
+    std::vector<UR> parameters;
+    for (Index i : dp.get_parameters()) {
+        parameters.push_back(saved_fsts[i]);
+    }
+    saved_fsts[ngram] = ngram_counts(parameters, ug_counts, alignemes, ug_weight);
     std::cout << "\tCompleted initial NGram count.\n";
+
+    std::ofstream dp_file("dp_updates.out", std::ios_base::out);
+    std::ofstream ur_file("ur_indices.out", std::ios_base::out);
+    dp_file << "step i sample nlld\n";
+    ur_file << "sample form\n";
 
     for (int step = 0; step < steps; ++step) {
         std::cout << "\tStarting step " << step << ".\n";
@@ -594,19 +607,22 @@ FST gibbs_fst_dijkstra(
             Semiring sample_p;
             std::tie(sample, sample_p) = dp.sample(engine, i);
             dp.update(i, sample);
-
-            std::pair<UR, Semiring> best = (*lexicon)[i];
-            if (step < steps * burn_in) {
-                if (sample_p > std::get<Semiring>(best)) {
-                    (*lexicon)[i] = std::pair(saved_fsts[sample], sample_p);
-                }
-            }
+            dp_file << step << ' ' << i << ' ' << sample << ' ' << sample_p.Value() << '\n';
         }
         if (step % rebuild_every == rebuild_every - 1) {
-            saved_fsts[ngram] = ngram_counts(*lexicon, ug_counts, alignemes, ug_weight);
+            parameters.clear();
+            for (Index i : dp.get_parameters()) {
+                parameters.push_back(saved_fsts[i]);
+            }
+            saved_fsts[ngram] = ngram_counts(parameters, ug_counts, alignemes, ug_weight);
             likelihood_cache.clear();
             compose_cache.clear();
         }
+    }
+
+    for (Index i = 0; i < (int) saved_fsts.size(); ++i) {
+        Form form = fst_to_form(saved_fsts[i]);
+        ur_file << i << ' ' << display_form(form, phonemes);
     }
 
     return saved_fsts[ngram];
@@ -664,10 +680,6 @@ int main(int argc, char* argv[]) {
         .scan<'d', size_t>()
         .required()
         .help("the number of gibbs steps to do");
-    program.add_argument("--burn-in")
-        .scan<'g', double>()
-        .required()
-        .help("the percent of the steps to be used as burn in, given as a value between 0.0 and 1.0");
     program.add_argument("--alpha")
         .scan<'g', double>()
         .required()
@@ -704,25 +716,37 @@ int main(int argc, char* argv[]) {
     std::string epsilon_ident = program.get<std::string>("--epsilon");
     phonemes.special("epsilon");
     if (epsilon_ident != "") {
-        // TODO: associating with an already present label should change the
-        // label of the special
         phonemes.associate_special("epsilon", epsilon_ident);
+    } else {
+        phonemes.associate_special("epsilon", "");
     }
     std::string phi_ident = program.get<std::string>("--phi");
     phonemes.special("phi");
     if (phi_ident != "") {
         phonemes.associate_special("phi", phi_ident);
+    } else {
+        phonemes.associate_special("phi", "");
     }
     // TODO: add start and end implicitly if they're unset
     std::string start_ident = program.get<std::string>("--start");
+    bool explicit_start;
     phonemes.special("start");
     if (start_ident != "") {
+        explicit_start = true;
         phonemes.associate_special("start", start_ident);
+    } else {
+        explicit_start = false;
+        phonemes.associate_special("start", "");
     }
     std::string end_ident = program.get<std::string>("--end");
+    bool explicit_end;
     phonemes.special("end");
     if (end_ident != "") {
+        explicit_end = true;
         phonemes.associate_special("end", end_ident);
+    } else {
+        explicit_end = false;
+        phonemes.associate_special("end", "");
     }
 
     // TODO: safely check that each arg is in a reasonable range
@@ -749,7 +773,6 @@ int main(int argc, char* argv[]) {
     std::string observations_path = program.get<std::string>("--observations");
 
     size_t steps = program.get<size_t>("--steps");
-    double burn_in = program.get<double>("--burn-in");
     double alpha = program.get<double>("--alpha");
     double universal_grammar_weight = program.get<double>("--universal-grammar-weight");
     size_t rebuild_stride = program.get<size_t>("--rebuild-stride");
@@ -778,8 +801,14 @@ int main(int argc, char* argv[]) {
         // TODO: This (and isomorphism) is not robust to end of line whitespace
         std::vector<Text> segments = split(line, ' ');
         Form values;
+        if (not explicit_start) {
+            values.push_back(phonemes.special("start"));
+        }
         for (Text segment : segments) {
             values.push_back(phonemes.encode(segment));
+        }
+        if (not explicit_end) {
+            values.push_back(phonemes.special("end"));
         }
         observations.push_back(values);
     }
@@ -889,27 +918,11 @@ int main(int argc, char* argv[]) {
 
     Lexicon lexicon;
     FST fst = gibbs_fst_dijkstra(
-            &lexicon, steps, burn_in, engine, observations, ug, alignemes, alpha,
-            universal_grammar_weight, rebuild_stride);
+            steps, engine, observations, ug, alignemes,
+            phonemes, alpha, universal_grammar_weight, rebuild_stride);
 
     std::cout << "Completed Gibbs sampling.\n";
-    std::cout << "Displaying:\n";
 
-
-    // Display first and last assignments
-    for (ulong form = 0; form < observations.size(); ++form) {
-        Form sr = observations[form];
-        FST urfst;
-        Semiring likelihood;
-        std::tie(urfst, likelihood) = lexicon[form];
-        std::vector<Semiring> dist;
-        Form ur = fst_to_form(urfst);
-        display_form(sr, phonemes, "[", "]", "\t");
-        display_form(ur, phonemes, "\t/", "/", "\t");
-        std::cout << likelihood.Value() << "\n";
-    }
-
-    // TODO: consider switching from wide chars to u8
-    std::cout << ctrack::result_as_string();
+    // std::cout << ctrack::result_as_string();
 }
 

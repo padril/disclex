@@ -222,6 +222,10 @@ public:
     void update(Index i, Parameter theta) {
         parameters[i] = theta;
     }
+
+    Map<Index, Parameter> get_parameters() {
+        return parameters;
+    }
 };
 
 }  // namespace distribution

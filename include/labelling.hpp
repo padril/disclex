@@ -47,6 +47,9 @@ public:
     }
     std::vector<Label> labels() {
         std::vector<Label> ret;
+        for (auto& [_, label] : specials) {
+            ret.push_back(label);
+        }
         for (auto& [label, _] : map) {
             ret.push_back(label);
         }
