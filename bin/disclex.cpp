@@ -266,7 +266,6 @@ std::string display_form(
     ret += lwrap;
     for (Label segment : form) {
         if (segment == labelling.special("epsilon")) { continue; }
-        std::cout << segment << ' ' << labelling.decode(segment) << '\n';
         ret += labelling.decode(segment);
     }
     ret += rwrap + end;
@@ -497,8 +496,9 @@ FST gibbs_fst_dijkstra(
         Labelling<Label, Text, Text>& phonemes,
         Semiring alpha,
         double ug_weight,
-        size_t rebuild_every
-        )
+        size_t rebuild_every,
+        std::ofstream& dp_file,
+        std::ofstream& ur_file)
 {
     using Index = int;
 
@@ -594,8 +594,6 @@ FST gibbs_fst_dijkstra(
     saved_fsts[ngram] = ngram_counts(parameters, ug_counts, alignemes, ug_weight);
     std::cout << "\tCompleted initial NGram count.\n";
 
-    std::ofstream dp_file("dp_updates.out", std::ios_base::out);
-    std::ofstream ur_file("ur_indices.out", std::ios_base::out);
     dp_file << "step i sample nlld\n";
     ur_file << "sample form\n";
 
@@ -699,10 +697,16 @@ int main(int argc, char* argv[]) {
         .scan<'d', size_t>()
         .help("what seed to use for the RNG if any");
 
+    program.add_argument("--output-deltas")
+        .required()
+        .help("the file to output DP process deltas to");
+    program.add_argument("--output-parameters")
+        .required()
+        .help("the file to output saved parameters to");
+
     try {
         program.parse_args(argc, argv);
-    }
-    catch (const std::exception& err) {
+    } catch (const std::exception& err) {
         std::cerr << err.what() << std::endl;
         std::cerr << program;
         return 1;
@@ -749,6 +753,8 @@ int main(int argc, char* argv[]) {
         phonemes.associate_special("end", "");
     }
 
+    std::string output_deltas_path = program.get<std::string>("--output-deltas");
+    std::string output_parameters_path = program.get<std::string>("--output-parameters");
     // TODO: safely check that each arg is in a reasonable range
     // TODO: these should probably be unicode capable
     std::string phonemes_path = program.get<std::string>("--phonemes");
@@ -815,11 +821,11 @@ int main(int argc, char* argv[]) {
     // TODO: is there a way to defer this?
     observations_file.close();
 
-    std::ofstream phones_out_file("phones_int.txt", std::ios_base::out);
-    for (Label label : phonemes.labels()) {
-        phones_out_file << phonemes.decode(label) << ' ' << label << '\n';
-    }
-    phones_out_file.close();
+    // std::ofstream phones_out_file("phones_int.txt", std::ios_base::out);
+    // for (Label label : phonemes.labels()) {
+    //     phones_out_file << phonemes.decode(label) << ' ' << label << '\n';
+    // }
+    // phones_out_file.close();
 
 
     std::cout << "Successfully read surfaces file.\n";
@@ -917,9 +923,12 @@ int main(int argc, char* argv[]) {
     std::cout << "Starting Gibbs sampling:\n";
 
     Lexicon lexicon;
+    std::ofstream dp_file(output_deltas_path, std::ios_base::out);
+    std::ofstream ur_file(output_parameters_path, std::ios_base::out);
     FST fst = gibbs_fst_dijkstra(
             steps, engine, observations, ug, alignemes,
-            phonemes, alpha, universal_grammar_weight, rebuild_stride);
+            phonemes, alpha, universal_grammar_weight, rebuild_stride,
+            dp_file, ur_file);
 
     std::cout << "Completed Gibbs sampling.\n";
 
