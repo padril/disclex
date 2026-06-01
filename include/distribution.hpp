@@ -4,6 +4,7 @@
 #include <functional>
 #include <optional>
 #include <variant>
+#include "external/ctrack.hpp"
 // TODO: Across the board, figure out what to mark as final
 
 namespace distribution {
@@ -87,6 +88,24 @@ public:
     }
 };
 
+// TODO: Might not need this
+// template <typename Value, typename Semiring, typename Engine, typename Given, typename Method>
+// class CompositeDistribution : public Distribution<Value, Semiring, Engine, std::pair<Method, Given>> {
+// private:
+//     using Chosen = Distribution<Value, Semiring, Engine, Given>;
+//     using ChoiceFn = std::function<Chosen*(Method)>;
+//     ChoiceFn choice;
+// public:
+//     CompositeDistribution(ChoiceFn choice) : choice(choice) {};
+//     std::pair<Value, Semiring> sample(
+//             Engine& engine, std::pair<Method, Given> method_given) override {
+//         Method method;
+//         Given given;
+//         std::tie(method, given) = method_given;
+//         return choice(method)->sample(engine, given);
+//     }
+// };
+
 // TODO: type erasure to make std::vector any iterator
 // TODO: is there something a little more generic than std::vector across the board?
 template <typename Value, typename Semiring, typename Engine, typename Given>
@@ -143,6 +162,7 @@ public:
             Engine& engine,
             std::pair<std::optional<FST>, std::optional<FST>> given) override
     {
+        CTRACK;
         FST fst_ = *fst;
         if (given.first) {
             fst_ = compose(given.first.value(), fst_);
@@ -160,11 +180,11 @@ template <
     typename Parameter, typename Semiring, typename Engine, typename Index,
     typename Observation, template <typename, typename> typename Map
     >
-class GibbsDirichletProcess : public Distribution<Parameter, Semiring, Engine, Index> {
+class CRPDirichletProcess : public Distribution<Parameter, Semiring, Engine, Index> {
 public:
+    Distribution<Parameter, Semiring, Engine, Observation>* prior;  // G_0
 private:
     // TODO: do we have to use a pointer? or is reference fine? i don't remember
-    Distribution<Parameter, Semiring, Engine, Observation>* prior;  // G_0
     Semiring alpha;
     // TODO: make Map a better generic
     // TODO: pair these into std::pair<Observation, Parameter>
@@ -176,7 +196,7 @@ private:
 public:
     // TODO: there should be an alternative version that defines integrated
     // likelihood for you, under some circumstances
-    GibbsDirichletProcess(
+    CRPDirichletProcess(
             Distribution<Parameter, Semiring, Engine, Observation> *prior,
             Semiring alpha,
             Map<Index, Observation> observations,
@@ -194,6 +214,9 @@ public:
             {}
 
     std::pair<Parameter, Semiring> sample(Engine& engine, Index i) override {
+        CTRACK;
+        // TODO: Likelihood temperature
+
         Semiring r_i = alpha * integrated_likelihood(observations[i]);
 
         Semiring bound = Semiring::Zero();
@@ -211,6 +234,7 @@ public:
                 return std::pair(parameters[j], q_i_j / r_i);
             }
         }
+
         // NOTE: we can ignore the calculation of b because of this being
         // essentially an "otherwise", so we don't need to add up to 1
         Parameter theta;
@@ -225,6 +249,50 @@ public:
 
     Map<Index, Parameter> get_parameters() {
         return parameters;
+    }
+};
+
+template <typename State, typename Semiring, typename Engine, typename Given>
+class MetropolisHastings : public Distribution<State, Semiring, Engine, Given> {
+private:
+    State state;
+    std::function<Semiring(State, Given)> stationary;
+    Distribution<State, std::pair<Semiring, Semiring>, Engine, State>* proposal;
+    Distribution<Semiring, std::monostate, Engine, std::monostate>* uniform;
+public:
+    MetropolisHastings(
+            State initial_state,
+            std::function<Semiring(State, Given)> stationary,
+            Distribution<State, std::pair<Semiring, Semiring>, Engine, State>* proposal,
+            Distribution<Semiring, std::monostate, Engine, std::monostate>* uniform
+            ) : state(initial_state),
+                stationary(stationary),
+                proposal(proposal),
+                uniform(uniform)
+            {}
+
+    std::pair<State, Semiring> sample(Engine& engine, Given given) {
+        State next;
+        std::pair<Semiring, Semiring> forward_reverse;
+        Semiring forward_p, reverse_p;
+        std::tie(next, forward_reverse) =
+            proposal->sample(engine, state);
+        std::tie(forward_p, reverse_p) = forward_reverse;
+        Semiring curr_p = stationary(state, given);
+        Semiring next_p = stationary(next, given);
+        Semiring accept_p = std::min(
+                Semiring::One(), (next_p / curr_p) * (reverse_p / forward_p));
+        Semiring u = std::get<Semiring>(uniform->sample(engine, std::monostate()));
+        if (u <= accept_p) {
+            return std::pair(next, forward_p * accept_p);
+        } else {
+            return std::pair(state, Semiring::One() - forward_p * accept_p);
+        }
+
+    }
+
+    void update(State next) {
+        state = next;
     }
 };
 
