@@ -3,6 +3,7 @@ from collections import Counter
 from itertools import combinations
 from dataclasses import dataclass
 import numpy as np
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 @dataclass
@@ -116,7 +117,7 @@ def main(args: list[str]):
     ps = []
     rs = []
     fs = []
-    for delta in real_deltas:
+    for delta in tqdm(real_deltas):
         if delta.observation in hyp_narrowed:
             hyp_narrowed[delta.observation] = delta.sample
         hyp = grouping_lexicon(hyp_narrowed)
