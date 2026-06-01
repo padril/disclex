@@ -37,7 +37,7 @@ def make_deltas(surfaces_path: Path | str,
     dp_updates = dp_updates.strip().split('\n')[1:]
     dp_updates = [d.strip().split() for d in dp_updates]
     dp_updates = [Delta(sr_dict[int(sr)], ur_dict[int(ur)], float(nlld))
-                  for _, sr, ur, nlld in dp_updates]
+                  for _, _, sr, ur, nlld in dp_updates]
 
     return dp_updates
 
