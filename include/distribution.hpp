@@ -192,6 +192,7 @@ private:
     Map<Index, Parameter> parameters;      // theta
     std::function<Semiring(Observation, Parameter)> likelihood;  // F
     std::function<Semiring(Observation)> integrated_likelihood;  // the integral defining r_i
+    std::function<bool(Observation, Parameter)> neighbours;  // Not mentioned in Neal, see metric DPs
     Distribution<Semiring, std::monostate, Engine, std::monostate>* uniform;
 public:
     // TODO: there should be an alternative version that defines integrated
@@ -203,6 +204,7 @@ public:
             Map<Index, Parameter> initial_parameters,
             std::function<Semiring(Observation, Parameter)> likelihood,
             std::function<Semiring(Observation)> integrated_likelihood,
+            std::function<bool(Observation, Parameter)> neighbours,
             Distribution<Semiring, std::monostate, Engine, std::monostate>* uniform
             ) : prior(prior),
                 alpha(alpha),
@@ -210,6 +212,7 @@ public:
                 parameters(initial_parameters),
                 likelihood(likelihood),
                 integrated_likelihood(integrated_likelihood),
+                neighbours(neighbours),
                 uniform(uniform)
             {}
 
@@ -228,6 +231,7 @@ public:
         // to store counts and assignments instead
         for (Index j = 0; j < (Index) parameters.size(); ++j) {
             if (i == j) { continue; }
+            if (!neighbours(observations[i], parameters[j])) { continue; }
             Semiring q_i_j = likelihood(observations[i], parameters[j]);
             bound += q_i_j;
             if (next <= bound) {

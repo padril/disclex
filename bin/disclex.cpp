@@ -17,7 +17,7 @@
 #include <fst/fstlib.h>
 #include <ngram/ngram.h>
 
-#include "external/ctrack.hpp"
+// #include "external/ctrack.hpp"
 
 // using Eigen::MatrixXd;
 
@@ -175,6 +175,8 @@ Form fst_to_form(const FST& fst) {
     auto state = fst.Start();
     if (state == fst::kNoStateId) return form;
 
+    // TODO(padril): This should return something different if the FST is
+    //               non-linear
     // TODO(padril): arbitrary max_length
     for (size_t i = 0; i < 30; ++i) {
         if (fst.Final(state) != Semiring::Zero()) {
@@ -356,7 +358,6 @@ FST ngram_counts(
 
 // TODO(padril): may not need to pass as copy
 std::pair<FST, Semiring> random_walk(Engine& engine, FST fst) {
-    CTRACK;
     // TODO(padril): might want to normalize using forward-backward first
     UniformSemiring uniform;
 
@@ -421,7 +422,6 @@ std::pair<FST, Semiring> random_walk(Engine& engine, FST fst) {
 
 inline
 FST compose(const FST& left, const FST& right) {
-    CTRACK;
     FST ret;
     fst::Compose(left, right, &ret);
 
@@ -429,7 +429,6 @@ FST compose(const FST& left, const FST& right) {
 }
 
 Semiring likelihood(FST fst, SR sr, UR ur) {
-    CTRACK;
     FST intermediate = compose(fst, sr);
     fst::ArcSort(&intermediate, fst::ILabelCompare<Arc>());
     FST composed = compose(ur, intermediate);
@@ -448,6 +447,50 @@ struct HashPair {
     }
 };
 
+// Slightly modified version of the code from @guilhermeagostinelli on github,
+// though this is a standard algorithm.
+int levenshtein(Form form1, Form form2) {
+    int size1 = form1.size();
+    int size2 = form2.size();
+    std::vector<std::vector<int>> verif(size1 + 1, std::vector<int>(size2 + 1));
+
+    // If one of the words has zero length, the distance is equal to the size of the other word.
+    if (size1 == 0) {
+        return size2;
+    } if (size2 == 0) {
+        return size1;
+    }
+
+    // Sets the first row and the first column of the verification matrix with the numerical order from 0 to the length of each word.
+    for (int i = 0; i <= size1; i++) {
+        verif[i][0] = i;
+    }
+    for (int j = 0; j <= size2; j++) {
+        verif[0][j] = j;
+    }
+
+    // Verification step / matrix filling.
+    for (int i = 1; i <= size1; i++) {
+        for (int j = 1; j <= size2; j++) {
+            // Sets the modification cost.
+            // 0 means no modification (i.e. equal letters) and 1 means that a modification is needed (i.e. unequal letters).
+            int cost = (form2[j - 1] == form1[i - 1]) ? 0 : 1;
+
+            // Sets the current position of the matrix as the minimum value between a (deletion), b (insertion) and c (substitution).
+            // a = the upper adjacent value plus 1: verif[i - 1][j] + 1
+            // b = the left adjacent value plus 1: verif[i][j - 1] + 1
+            // c = the upper left adjacent value plus the modification cost: verif[i - 1][j - 1] + cost
+            verif[i][j] = std::min(
+                std::min(verif[i - 1][j] + 1, verif[i][j - 1] + 1),
+                verif[i - 1][j - 1] + cost
+            );
+        }
+    }
+
+    // The last position of the matrix will contain the Levenshtein distance.
+    return verif[size1][size2];
+}
+
 // TODO(padril): split Form into UR and SR forms?
 // and maybe better name SR and UR
 void gibbs_fst_dijkstra(
@@ -461,7 +504,6 @@ void gibbs_fst_dijkstra(
         std::ofstream& dp_file,
         std::ofstream& ur_file,
         std::string fst_out_dir) {
-    CTRACK;
     using Index = int;
 
     // TODO(padril): This gets massive. A custom implementation may be better.
@@ -568,6 +610,12 @@ void gibbs_fst_dijkstra(
                 fst::ShortestDistance(*composed_fst, &dists, true);
                 return dists[composed_fst->Start()];
             },
+            [&saved_fsts](Index sr, Index ur) -> bool {
+                Form sr_form = fst_to_form(*saved_fsts[sr]);
+                Form ur_form = fst_to_form(*saved_fsts[ur]);
+                return levenshtein(sr_form, ur_form) <= 3;
+                // return true;  // Default full-conditional behaviour
+            },
             &uniform);
 
     std::vector<UR> parameters;
@@ -643,7 +691,8 @@ void gibbs_fst_dijkstra(
 
         for (size_t i = 0; i < observations.size(); ++i) {
             // TODO: Jank
-            if (std::get<Semiring>(uniform.sample(engine, std::monostate())) < Semiring(-std::log(0.1))) {
+            // if (std::get<Semiring>(uniform.sample(engine, std::monostate())) < Semiring(-std::log(0.1))) {
+            if (true) {
                 Index sample;
                 Semiring sample_p;
                 std::tie(sample, sample_p) = dp.sample(engine, i);
@@ -994,6 +1043,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Completed Gibbs sampling.\n";
 
-    std::cout << ctrack::result_as_string();
+    // std::cout << ctrack::result_as_string();
 }
 

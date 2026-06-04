@@ -140,8 +140,12 @@ def main(args: list[str]):
     plt.savefig("prf.png", dpi=300)
     plt.close()
 
+    parray = np.array(ps)
+    rarray = np.array(rs)
     farray = np.array(fs)
     print(f'mean f = {farray.mean()} with std = {farray.std()}')
+    print(f'\tmean p = {parray.mean()} with std = {parray.std()}')
+    print(f'\tmean r = {rarray.mean()} with std = {rarray.std()}')
 
 if __name__ == '__main__':
     import sys
