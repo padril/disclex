@@ -293,7 +293,8 @@ FST ngram_counts(
         NGramFST ug_model,
         Labelling<Label, std::pair<Label, Label>, Text>& labelling,
         double ug_weight,
-        double ident_weight) {
+        double ident_weight,
+        bool self_align = false) {
     // TODO(padril): Is this function actually correct?
     //  - We might not be weighting more common alignments better
     FST top;
@@ -305,37 +306,22 @@ FST ngram_counts(
     // Semiring worst = Semiring::Zero();
 
     for (size_t i = 0; i < observations.size(); ++i) {
-        SR sr = observations[i];
-        UR ur = parameters[i];
-        FST intermediate = compose(edit_fst, sr);
-        fst::ArcSort(&intermediate, fst::ILabelCompare<Arc>());
-        AR all_ars = compose(ur, intermediate);
         AR ar;
+        if (self_align) {
+            ar = parameters[i];
+        } else {
+            SR sr = observations[i];
+            UR ur = parameters[i];
+            FST intermediate = compose(edit_fst, sr);
+            fst::ArcSort(&intermediate, fst::ILabelCompare<Arc>());
+            AR all_ars = compose(ur, intermediate);
 
-        fst::StdVectorFst trop_all_ars;
-        fst::StdVectorFst trop_ar;
-        fst::ArcMap(all_ars, &trop_all_ars, fst::LogToStdMapper());
-        fst::ShortestPath(trop_all_ars, &trop_ar);
-        fst::ArcMap(trop_ar, &ar, fst::StdToLogMapper());
-
-        // std::vector<Semiring> dists;
-        // fst::ShortestDistance(ar, &dists, true);
-        // if (static_cast<size_t>(ar.Start()) >= dists.size()
-        //         || dists[ar.Start()] == Semiring::Zero()) { continue; }
-        // Semiring paths = dists[ar.Start()];
-
-        // if (paths < best) { best = paths; };
-        // if (paths > worst) { worst = paths; };
-
-        // for (fst::StateIterator<FST> siter(ar); !siter.Done(); siter.Next()) {
-        //     auto s = siter.Value();
-        //     auto final = ar.Final(s);
-        //     if (final != Semiring::Zero()) {
-        //         ar.SetFinal(s, final / paths);
-        //     }
-        // }
-        // TODO(padril): I don't think that AR weights matter for path
-        // count bias, but it would be nice to be sure
+            fst::StdVectorFst trop_all_ars;
+            fst::StdVectorFst trop_ar;
+            fst::ArcMap(all_ars, &trop_all_ars, fst::LogToStdMapper());
+            fst::ShortestPath(trop_all_ars, &trop_ar);
+            fst::ArcMap(trop_ar, &ar, fst::StdToLogMapper());
+        }
 
         fst::Union(&top, to_acceptor(labelling, ar));
     }
@@ -583,6 +569,7 @@ void gibbs_fst_dijkstra(
         Schedule ug_sched,
         Schedule ident_sched,
         size_t rebuild_every,
+        bool self_align,
         std::ofstream& dp_file,
         std::ofstream& ur_file,
         std::string fst_out_dir) {
@@ -789,7 +776,7 @@ void gibbs_fst_dijkstra(
 
 
     saved_fsts[ngram] = new FST(
-            ngram_counts(fst_observations, fst_parameters, ug_counts, alignemes, ug_weight, ident_weight));
+            ngram_counts(fst_observations, fst_parameters, ug_counts, alignemes, ug_weight, ident_weight, self_align));
     std::cout << "\tCompleted initial NGram count.\n";
 
     dp_file << "method step i sample nlld\n";
@@ -843,7 +830,7 @@ void gibbs_fst_dijkstra(
             }
             saved_fsts[ngram] = new FST(ngram_counts(
                         fst_observations, fst_parameters, ug_counts, alignemes,
-                        ug_weight, ident_weight));
+                        ug_weight, ident_weight, self_align));
             likelihood_cache.clear();
             compose_cache.clear();
 
@@ -946,6 +933,11 @@ int main(int argc, char* argv[]) {
         .required()
         .help("how many steps to take between rebuilding the learned "
               "phonology");
+    bool self_align = false;
+    program.add_argument("--self-align")
+        .store_into(self_align)
+        .required()
+        .help("what alignment method to use before counting ngrams");
 
     program.add_argument("--seed")
         .scan<'d', size_t>()
@@ -1265,6 +1257,7 @@ int main(int argc, char* argv[]) {
     gibbs_fst_dijkstra(
             steps, engine, alignments, ug, alignemes,
             phonemes, alpha, ug_schedule, ident_schedule, rebuild_stride,
+            self_align,
             dp_file, ur_file, output_fsts_dir);
 
     std::cout << "Completed Gibbs sampling.\n";
