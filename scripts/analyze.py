@@ -1,13 +1,16 @@
 from pathlib import Path
-from collections import Counter
+import math
+from collections import Counter, defaultdict
 from itertools import combinations
 from dataclasses import dataclass
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from Levenshtein import distance
 
 @dataclass
 class Delta:
+    step: int
     observation: str
     sample: str
     nlld: float
@@ -36,8 +39,8 @@ def make_deltas(surfaces_path: Path | str,
     dp_updates = Path(dp_updates_path).open('r').read()
     dp_updates = dp_updates.strip().split('\n')[1:]
     dp_updates = [d.strip().split() for d in dp_updates]
-    dp_updates = [Delta(sr_dict[int(sr)], ur_dict[int(ur)], float(nlld))
-                  for _, _, sr, ur, nlld in dp_updates]
+    dp_updates = [Delta(int(step), sr_dict[int(sr)], ur_dict[int(ur)], float(nlld))
+                  for _, step, sr, ur, nlld in dp_updates]
 
     return dp_updates
 
@@ -82,7 +85,41 @@ def grouping_lexicon(assignments: AssignmentLexicon) -> GroupingLexicon:
         lex |= set(combinations(group, 2))
     return lex
 
-def scores(ref: GroupingLexicon, hyp: GroupingLexicon):
+def ned(t: str, u: str):
+    return distance(t, u) / max(len(t), len(u))
+
+def scores(ref: AssignmentLexicon, hyp: AssignmentLexicon, cluster_ned, class_ned):
+    # Precision as WNES
+    clusters = defaultdict(list)
+    for k_i, i in hyp.items(): clusters[i].append(k_i)
+    wnes_num = 0
+    wnes_den = 0
+    for k in clusters.values():
+        if len(k) <= 1:
+            continue
+        ned_i = sum(cluster_ned(t, u) for t, u in combinations(k, 2))
+        wnes_num += (len(k) / math.comb(len(k), 2)) * ned_i
+        wnes_den += len(k)
+    p = 1 - wnes_num / wnes_den
+
+    # Recall as iWNES
+    classes = defaultdict(list)
+    for c_i, i in ref.items(): classes[i].append(hyp[c_i])
+    iwnes_num = 0
+    iwnes_den = 0
+    for c in classes.values():
+        if len(c) <= 1:
+            continue
+        ned_i = sum(class_ned(t, u) for t, u in combinations(c, 2))
+        iwnes_num += (len(c) / math.comb(len(c), 2)) * ned_i
+        iwnes_den += len(c)
+    r = 1 - iwnes_num / iwnes_den
+
+    f = 2 * (p * r) / (p + r) if not p == r == 0 else 0
+
+    return p, r, f
+
+def scores_unweighted(ref: GroupingLexicon, hyp: GroupingLexicon):
     common = {(a, b) for (a, b) in ref if (a, b) in hyp or (b, a) in hyp}
 
     p = len(common) / len(hyp) if hyp else 0
@@ -96,56 +133,110 @@ def main(args: list[str]):
 
     deltas = make_deltas(surfaces, dp_updates, ur_indices)
     burnin = 0.5
-    burnin_index = int(len(deltas) * burnin)
-    burnin_deltas = deltas[:burnin_index]
-    real_deltas = deltas[burnin_index:]
-    write_best_lexicon(real_deltas, 'gibbs_lexicon.tsv')
+    write_best_lexicon(deltas[int(len(deltas) * burnin):], 'gibbs_lexicon.tsv')
 
     hyp_assignments = initial_assignment_lexicon(surfaces)
     ref_assignments = parse_assignment_lexicon(gold_lexicon)
-    hyp_narrowed = {k: v for k, v in hyp_assignments.items()
+    hyp = {k: v for k, v in hyp_assignments.items()
                     if k in ref_assignments}
-    ref_narrowed = {k: v for k, v in ref_assignments.items()
+    ref = {k: v for k, v in ref_assignments.items()
                     if k in hyp_assignments}
-
-    ref = grouping_lexicon(ref_narrowed)
-
-    for delta in burnin_deltas:
-        if delta.observation in hyp_narrowed:
-            hyp_narrowed[delta.observation] = delta.sample
 
     ps = []
     rs = []
     fs = []
-    for delta in tqdm(real_deltas):
-        if delta.observation in hyp_narrowed:
-            hyp_narrowed[delta.observation] = delta.sample
-        hyp = grouping_lexicon(hyp_narrowed)
-        p, r, f = scores(ref, hyp)
-        ps.append(p)
-        rs.append(r)
-        fs.append(f)
+    temp_ps = []
+    temp_rs = []
+    temp_fs = []
+    bin_ps = []
+    bin_rs = []
+    bin_fs = []
+    temp_bin_ps = []
+    temp_bin_rs = []
+    temp_bin_fs = []
+    ups = []
+    urs = []
+    ufs = []
+    temp_ups = []
+    temp_urs = []
+    temp_ufs = []
 
-    _, ax1 = plt.subplots()
+    current_step = 0
 
-    plt.plot(ps, label="Precision")
-    plt.plot(rs, label="Recall")
-    plt.plot(fs, label="F-sore")
-    ax1.set_ylim(0, 1)
+    for delta in tqdm(deltas):
+        if delta.observation in hyp:
+            hyp[delta.observation] = delta.sample
+        p, r, f = scores(ref, hyp, ned, ned)
+        temp_ps.append(p)
+        temp_rs.append(r)
+        temp_fs.append(f)
+        bp, br, bf = scores(ref, hyp, lambda t, u: ref[t] != ref[u], lambda t, u: t != u)
+        temp_bin_ps.append(bp)
+        temp_bin_rs.append(br)
+        temp_bin_fs.append(bf)
+        up, ur, uf = scores_unweighted(grouping_lexicon(ref), grouping_lexicon(hyp))
+        temp_ups.append(up)
+        temp_urs.append(ur)
+        temp_ufs.append(uf)
+
+        if delta.step > current_step:
+            ps.append(sum(temp_ps) / len(temp_ps))
+            rs.append(sum(temp_rs) / len(temp_rs))
+            fs.append(sum(temp_fs) / len(temp_fs))
+            bin_ps.append(sum(temp_bin_ps) / len(temp_bin_ps))
+            bin_rs.append(sum(temp_bin_rs) / len(temp_bin_rs))
+            bin_fs.append(sum(temp_bin_fs) / len(temp_bin_fs))
+            ups.append(sum(temp_ups) / len(temp_ups))
+            urs.append(sum(temp_urs) / len(temp_urs))
+            ufs.append(sum(temp_ufs) / len(temp_ufs))
+            temp_ps = []
+            temp_rs = []
+            temp_fs = []
+            temp_bin_ps = []
+            temp_bin_rs = []
+            temp_bin_fs = []
+            temp_ups = []
+            temp_urs = []
+            temp_ufs = []
+            current_step = delta.step
+
+    fig, (ax1, ax2, ax3) = plt.subplots(ncols=3, figsize=(16, 4))
+
+    ax1.plot(ps, label="Precision (WNES)")
+    ax1.plot(rs, label="Recall (iWNES)")
+    ax1.plot(fs, label="F-sore")
+    ax1.set_ylim(-0.05, 1.05)
 
     lines = ax1.get_lines()
     labels = [str(line.get_label()) for line in lines]
     ax1.legend(lines, labels)
 
-    plt.savefig("prf.png", dpi=300)
-    plt.close()
+    ax2.plot(bin_ps, label="Precision (W≠)")
+    ax2.plot(bin_rs, label="Recall (iW≠)")
+    ax2.plot(bin_fs, label="F-sore")
+    ax2.set_ylim(-0.05, 1.05)
 
-    parray = np.array(ps)
-    rarray = np.array(rs)
-    farray = np.array(fs)
+    lines = ax2.get_lines()
+    labels = [str(line.get_label()) for line in lines]
+    ax2.legend(lines, labels)
+
+    ax3.plot(ups, label="Precision (grouping)")
+    ax3.plot(urs, label="Recall (grouping)")
+    ax3.plot(ufs, label="F-sore")
+    ax3.set_ylim(-0.05, 1.05)
+
+    lines = ax3.get_lines()
+    labels = [str(line.get_label()) for line in lines]
+    ax3.legend(lines, labels)
+
+    fig.savefig("prf.svg")
+
+    parray = np.array(ups[int(len(fs) * burnin):])
+    rarray = np.array(urs[int(len(fs) * burnin):])
+    farray = np.array(ufs[int(len(fs) * burnin):])
     print(f'mean f = {farray.mean()} with std = {farray.std()}')
-    print(f'\tmean p = {parray.mean()} with std = {parray.std()}')
-    print(f'\tmean r = {rarray.mean()} with std = {rarray.std()}')
+    print(f'\tmean p (wnes) = {parray.mean()} with std = {parray.std()}')
+    print(f'\tmean r (iwnes) = {rarray.mean()} with std = {rarray.std()}')
 
 if __name__ == '__main__':
     import sys

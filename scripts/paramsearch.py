@@ -3,9 +3,16 @@ from random import sample
 from pathlib import Path
 import time
 import numpy as np
-from analyze import *
+from analyze import (
+        make_deltas,
+        initial_assignment_lexicon,
+        parse_assignment_lexicon,
+        grouping_lexicon,
+        scores
+        )
 
 observations = 'data/valid_observations.txt'
+alignments = 'data/valid_alignments.txt'
 gold_lexicon = 'data/valid_lexicon.tsv'
 
 phonemes = 'data/phones.txt'
@@ -14,10 +21,11 @@ dp_updates = 'out/dp_updates.out'
 ur_indices = 'out/ur_indices.out'
 
 steps = 50
-rebuild_stride = 10
+rebuild_stride = 5
 
 def run_for_parameters(alpha, ug_mix, n_ratio):
     observation_list = Path(observations).open('r').read().strip().split('\n')
+    alignments_list = Path(alignments).open('r').read().strip().split('\n')
     n = len(observation_list)
     narrowed_n = int(n * n_ratio)
     narrowed_list = sample(observation_list, narrowed_n)
@@ -25,13 +33,13 @@ def run_for_parameters(alpha, ug_mix, n_ratio):
     with Path(narrowed).open('w') as f:
         for line in narrowed_list:
             print(line, file=f)
-
+ 
     seed = int((time.time() * 1e7) % 1e7)
     
     command = ['./build/bin/disclex',
                '--prior', 'fst',
                '--phones', phonemes,
-               '--observations', narrowed,
+               '--alignments', narrowed,
                '--phonemes', phonemes,
                '--steps', str(steps),
                '--rebuild-stride', str(rebuild_stride),
@@ -39,6 +47,7 @@ def run_for_parameters(alpha, ug_mix, n_ratio):
                '--universal-grammar-weight', str(ug_mix),
                '--output-deltas', dp_updates,
                '--output-parameters', ur_indices,
+               '--output-fsts-dir', 'out/fsts/'
                '--seed', str(seed)]
     print(' '.join(command))
     subprocess.run(command)
@@ -79,8 +88,8 @@ def main():
     true_n = len(observation_list)
     for alpha in [4.0, 5.0, 6.0, 7.0, 8.0]:
         for ug_mix in [0.05, 0.25, 0.45, 0.65, 0.85, 1.05]:
-            for n_ratio in [0.4, 0.7, 1.0]:
-                for chain in [1, 2]:
+            for n_ratio in [1.0]:
+                for chain in [1, 2, 3]:
                     mean_f, std_f = run_for_parameters(alpha, ug_mix, n_ratio)
                     n = int(true_n * n_ratio)
                     print(f'chain={chain}, '

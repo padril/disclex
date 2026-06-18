@@ -40,6 +40,8 @@ template <typename Index, typename Held>
 using LexiconMap = std::vector<Held>;
 using Lexicon = LexiconMap<int, std::pair<UR, Semiring>>;
 
+static FST edit_fst;
+static NGramFST ident_grammar;
 
 // Doing a lot of operator overloading allows the API to behave better when
 // we use the Semirings as we would doubles
@@ -277,15 +279,70 @@ fst::VectorFst<A> from_acceptor(
     return result;
 }
 
+inline
+FST compose(const FST& left, const FST& right) {
+    FST ret;
+    fst::Compose(left, right, &ret);
+
+    return ret;
+}
+
 FST ngram_counts(
-        std::vector<UR> parameters, NGramFST ug_model,
+        std::vector<SR> observations,
+        std::vector<UR> parameters,
+        NGramFST ug_model,
         Labelling<Label, std::pair<Label, Label>, Text>& labelling,
-        double ug_weight) {
+        double ug_weight,
+        double ident_weight) {
+    // TODO(padril): Is this function actually correct?
+    //  - We might not be weighting more common alignments better
     FST top;
 
-    for (UR ur : parameters) {
-        fst::Union(&top, to_acceptor(labelling, ur));
+    // TODO(padril): better error handling than this
+    assert(observations.size() == parameters.size());
+
+    // Semiring best(-std::numeric_limits<float>::infinity());
+    // Semiring worst = Semiring::Zero();
+
+    for (size_t i = 0; i < observations.size(); ++i) {
+        SR sr = observations[i];
+        UR ur = parameters[i];
+        FST intermediate = compose(edit_fst, sr);
+        fst::ArcSort(&intermediate, fst::ILabelCompare<Arc>());
+        AR all_ars = compose(ur, intermediate);
+        AR ar;
+
+        fst::StdVectorFst trop_all_ars;
+        fst::StdVectorFst trop_ar;
+        fst::ArcMap(all_ars, &trop_all_ars, fst::LogToStdMapper());
+        fst::ShortestPath(trop_all_ars, &trop_ar);
+        fst::ArcMap(trop_ar, &ar, fst::StdToLogMapper());
+
+        // std::vector<Semiring> dists;
+        // fst::ShortestDistance(ar, &dists, true);
+        // if (static_cast<size_t>(ar.Start()) >= dists.size()
+        //         || dists[ar.Start()] == Semiring::Zero()) { continue; }
+        // Semiring paths = dists[ar.Start()];
+
+        // if (paths < best) { best = paths; };
+        // if (paths > worst) { worst = paths; };
+
+        // for (fst::StateIterator<FST> siter(ar); !siter.Done(); siter.Next()) {
+        //     auto s = siter.Value();
+        //     auto final = ar.Final(s);
+        //     if (final != Semiring::Zero()) {
+        //         ar.SetFinal(s, final / paths);
+        //     }
+        // }
+        // TODO(padril): I don't think that AR weights matter for path
+        // count bias, but it would be nice to be sure
+
+        fst::Union(&top, to_acceptor(labelling, ar));
     }
+
+    // std::cout << "\t\tMin alignment path count: e^" << -best.Value() << "\n";
+    // std::cout << "\t\tMax alignment path count: e^" << -worst.Value() << "\n";
+
     fst::RmEpsilon(&top);
     fst::Determinize(top, &top);
 
@@ -319,6 +376,7 @@ FST ngram_counts(
     ngram::NGramModelMerge merger(&model, backoff_label);
     // TODO(padril): check if alpha is in the right order
     merger.MergeNGramModels(ug_model, 1.0, ug_weight, true);
+    merger.MergeNGramModels(ident_grammar, 1.0, ident_weight, true);
 
     FST transform;
     fst::ArcMap(model, &transform, fst::StdToLogMapper());
@@ -357,7 +415,7 @@ FST ngram_counts(
 }
 
 // TODO(padril): may not need to pass as copy
-std::pair<FST, Semiring> random_walk(Engine& engine, FST fst) {
+std::pair<FST, Semiring> random_walk(Engine& engine, FST fst, Label start, Label end) {
     // TODO(padril): might want to normalize using forward-backward first
     UniformSemiring uniform;
 
@@ -372,6 +430,17 @@ std::pair<FST, Semiring> random_walk(Engine& engine, FST fst) {
     // fst::RandGen does not return probability weights, so we need to write
     // this ourselves
     FST::StateId curr = fst.Start();
+    for (fst::ArcIterator<FST> aiter(fst, curr); !aiter.Done(); aiter.Next()) {
+        Arc arc = aiter.Value();
+        if (arc.ilabel == start && arc.olabel == start) {
+            FST::StateId ur_next = ur.AddState();
+            auto new_arc = Arc( arc.ilabel, arc.ilabel, Semiring::One(), ur_next);
+            ur.AddArc(ur_curr, new_arc);
+            ur_curr = ur_next;
+            curr = arc.nextstate;
+            break;
+        }
+    }
 
     // TODO(padril): there is a sampling bug where we get a segfault when we
     //               hit max length
@@ -390,6 +459,12 @@ std::pair<FST, Semiring> random_walk(Engine& engine, FST fst) {
         Semiring bound = final;
         Semiring next = std::get<Semiring>(
                 uniform.sample(engine, std::monostate())) * sum;
+        if (next <= bound) {  // Final probability got hit
+            p *= bound;
+            ur.SetFinal(ur_curr, Semiring::One());
+            fst::ArcSort(&ur, fst::ILabelCompare<Arc>());
+            return std::pair(ur, p);
+        }
         if (next <= bound) {  // Final probability got hit
             p *= bound;
             ur.SetFinal(ur_curr, Semiring::One());
@@ -415,17 +490,15 @@ std::pair<FST, Semiring> random_walk(Engine& engine, FST fst) {
         }
     }
     // Hit max length
+    {
+        FST::StateId ur_next = ur.AddState();
+        auto new_arc = Arc( end, end, Semiring::One(), ur_next);
+        ur.AddArc(ur_curr, new_arc);
+        ur_curr = ur_next;
+    }
     ur.SetFinal(ur_curr, Semiring::One());
     fst::ArcSort(&ur, fst::ILabelCompare<Arc>());
     return std::pair(ur, p);
-}
-
-inline
-FST compose(const FST& left, const FST& right) {
-    FST ret;
-    fst::Compose(left, right, &ret);
-
-    return ret;
 }
 
 Semiring likelihood(FST fst, SR sr, UR ur) {
@@ -434,7 +507,8 @@ Semiring likelihood(FST fst, SR sr, UR ur) {
     FST composed = compose(ur, intermediate);
     std::vector<Semiring> dists;
     fst::ShortestDistance(composed, &dists, true);
-    return dists[composed.Start()];
+    return static_cast<size_t>(composed.Start()) < dists.size() ?
+        dists[composed.Start()] : Semiring::Zero();
 }
 
 // TODO(padril): could be way better, maybe using boost
@@ -491,20 +565,35 @@ int levenshtein(Form form1, Form form2) {
     return verif[size1][size2];
 }
 
+struct Schedule {
+    double boundary;
+    double interior;
+    size_t peak_step;
+};
+
 // TODO(padril): split Form into UR and SR forms?
 // and maybe better name SR and UR
 void gibbs_fst_dijkstra(
-        int steps, Engine engine, std::vector<Form> surface_forms,
+        size_t steps, Engine engine,
+        std::vector<std::pair<Form, Form>> initial_alignment,
         NGramFST ug_counts,
         Labelling<Label, std::pair<Label, Label>, Text>& alignemes,
         Labelling<Label, Text, Text>& phonemes,
         Semiring alpha,
-        double ug_weight,
+        Schedule ug_sched,
+        Schedule ident_sched,
         size_t rebuild_every,
         std::ofstream& dp_file,
         std::ofstream& ur_file,
         std::string fst_out_dir) {
     using Index = int;
+
+    double ug_weight = ug_sched.boundary;
+    double ug_delta = (ug_sched.interior - ug_sched.boundary)
+        / ug_sched.peak_step;
+    double ident_weight = ident_sched.boundary;
+    double ident_delta = (ident_sched.interior - ident_sched.boundary)
+        / ident_sched.peak_step;
 
     // TODO(padril): This gets massive. A custom implementation may be better.
     // TODO(padril): switch to unique_ptr across the repo
@@ -518,17 +607,13 @@ void gibbs_fst_dijkstra(
     // TODO(padril): Lexicon should be its own abstraction
     std::vector<Index> observations;
     std::vector<Index> initial_parameters;
-    for (Form sr : surface_forms) {
-        UR* ur_fst = new UR(form_to_fst(sr));
-        // UR* ur_fst = new UR(form_to_fst(Form({
-        //                 phonemes.special("start"),
-        //                 phonemes.special("end")
-        //                 })));
+    for (auto [sr, ur] : initial_alignment) {
         SR* sr_fst = new SR(form_to_fst(sr));
-        saved_fsts.push_back(ur_fst);
-        initial_parameters.push_back(saved_fsts.size() - 1);
+        UR* ur_fst = new UR(form_to_fst(ur));
         saved_fsts.push_back(sr_fst);
         observations.push_back(saved_fsts.size() - 1);
+        saved_fsts.push_back(ur_fst);
+        initial_parameters.push_back(saved_fsts.size() - 1);
     }
     std::cout << "\tCompleted initial alignment.\n";
 
@@ -544,11 +629,12 @@ void gibbs_fst_dijkstra(
         std::pair<std::optional<Index>, std::optional<Index>>> prior(
         new distribution::FSTDistribution<Index, Semiring, Engine, Index>(
             &ngram,
-            [&saved_fsts](
+            [&saved_fsts, &phonemes](
                 Engine& engine, Index fst) -> std::pair<Index, Semiring> {
                 UR* ur = new UR();
                 Semiring p;
-                std::tie(*ur, p) = random_walk(engine, *saved_fsts[fst]);
+                std::tie(*ur, p) = random_walk(engine, *saved_fsts[fst],
+                        phonemes.special("start"), phonemes.special("end"));
                 saved_fsts.push_back(ur);
                 return std::pair(saved_fsts.size() - 1, p);
             },
@@ -608,19 +694,45 @@ void gibbs_fst_dijkstra(
                 // TODO(padril): make shortestdistance gracefully exit when no
                 //               dists found
                 fst::ShortestDistance(*composed_fst, &dists, true);
-                return dists[composed_fst->Start()];
+                return static_cast<size_t>(composed_fst->Start()) < dists.size() ?
+                    dists[composed_fst->Start()] : Semiring::Zero();
             },
-            [&saved_fsts](Index sr, Index ur) -> bool {
+            [&saved_fsts, &phonemes, &uniform, &engine](Index sr, Index ur) -> bool {
                 Form sr_form = fst_to_form(*saved_fsts[sr]);
+                sr_form.erase(
+                        std::remove_if(
+                            sr_form.begin(),
+                            sr_form.end(),
+                            [&phonemes](Label x) -> bool {
+                                return x == phonemes.special("epsilon");
+                            }),
+                        sr_form.end());
                 Form ur_form = fst_to_form(*saved_fsts[ur]);
-                return levenshtein(sr_form, ur_form) <= 3;
+                ur_form.erase(
+                        std::remove_if(
+                            ur_form.begin(),
+                            ur_form.end(),
+                            [&phonemes](Label x) -> bool {
+                                return x == phonemes.special("epsilon");
+                            }),
+                        ur_form.end());
+                Semiring soft_p(-std::log(0.01));
+                Semiring soft_sample = std::get<Semiring>(
+                        uniform.sample(engine, std::monostate()));
+                return levenshtein(sr_form, ur_form) <= 3
+                    || soft_sample <= soft_p;
                 // return true;  // Default full-conditional behaviour
             },
             &uniform);
 
-    std::vector<UR> parameters;
+    std::vector<UR> fst_parameters;
     for (Index i : dp.get_parameters()) {
-        parameters.push_back(*saved_fsts[i]);
+        fst_parameters.push_back(*saved_fsts[i]);
+    }
+
+    std::vector<UR> fst_observations;
+    for (Index i : observations) {
+        fst_observations.push_back(*saved_fsts[i]);
     }
 
     // TODO: This can be abstracted, like Uniform, and moved to distributions.hpp
@@ -677,17 +789,19 @@ void gibbs_fst_dijkstra(
 
 
     saved_fsts[ngram] = new FST(
-            ngram_counts(parameters, ug_counts, alignemes, ug_weight));
+            ngram_counts(fst_observations, fst_parameters, ug_counts, alignemes, ug_weight, ident_weight));
     std::cout << "\tCompleted initial NGram count.\n";
 
     dp_file << "method step i sample nlld\n";
     ur_file << "sample form\n";
 
-    for (int step = 0; step < steps; ++step) {
+    for (size_t step = 0; step < steps; ++step) {
         likelihood_hits = 0;
         likelihood_misses = 0;
 
-        std::cout << "\tStarting step " << step << ".\n";
+        std::cout << "\tStarting step " << step
+            << " with UG=" << ug_weight
+            << " ID=" << ident_weight << ".\n";
 
         for (size_t i = 0; i < observations.size(); ++i) {
             // TODO: Jank
@@ -719,22 +833,35 @@ void gibbs_fst_dijkstra(
 
         double hit_ratio = static_cast<double>(likelihood_hits)
             / (likelihood_hits + likelihood_misses);
-        std::cout << "\tLikelihood cache hit ratio : " << hit_ratio << "\n";
+        std::cout << "\t\tLikelihood cache hit ratio : " << hit_ratio << "\n";
 
         if (step % rebuild_every == rebuild_every - 1) {
-            parameters.clear();
+            std::cout << "\tRebuilding ngram model\n";
+            fst_parameters.clear();
             for (Index i : dp.get_parameters()) {
-                parameters.push_back(*saved_fsts[i]);
+                fst_parameters.push_back(*saved_fsts[i]);
             }
             saved_fsts[ngram] = new FST(ngram_counts(
-                        parameters, ug_counts, alignemes, ug_weight));
+                        fst_observations, fst_parameters, ug_counts, alignemes,
+                        ug_weight, ident_weight));
             likelihood_cache.clear();
             compose_cache.clear();
 
-            std::string fst_out_file = fst_out_dir + "fst_"
+            std::string fst_out_path = fst_out_dir + "step_"
                 + std::to_string(step) + ".fst";
-            saved_fsts[ngram]->Write(fst_out_file);
+            // TODO(padril): Do not pickle as a .fst, but rather as an
+            //               alignment file (which should be standardized for
+            //               the repo).
+            saved_fsts[ngram]->Write(fst_out_path);
         }
+        if (step == ug_sched.peak_step) {
+            ug_delta = (ug_sched.boundary - ug_sched.interior) / (steps - step);
+        }
+        if (step == ident_sched.peak_step) {
+            ident_delta = (ident_sched.boundary - ident_sched.interior) / (steps - step);
+        }
+        ug_weight += ug_delta;
+        ident_weight += ident_delta;
     }
 
     for (Index i = 0; i < static_cast<Index>(saved_fsts.size()); ++i) {
@@ -752,10 +879,10 @@ int main(int argc, char* argv[]) {
         .required()
         .help("which type of prior should be used");
 
-    program.add_argument("--observations")
+    program.add_argument("--alignments")
         .required()
-        .help("the file containing the observed phonetic forms, each on its"
-              "own line, with phones separated by spaces");
+        .help("the file containing the initial alignment forms. see format "
+              "specification in the README");
 
     // TODO(padril): maybe infer this from the input wordlist
     program.add_argument("--phones")
@@ -806,8 +933,11 @@ int main(int argc, char* argv[]) {
         .help("the alpha parameter for the dirichlet process");
 
     // should these be FST only?
-    program.add_argument("--universal-grammar-weight")
-        .scan<'g', double>()
+    program.add_argument("--universal-grammar-schedule")
+        .required()
+        .help("how much to value the universal grammar relative to the "
+              "learned phonology");
+    program.add_argument("--identity-grammar-schedule")
         .required()
         .help("how much to value the universal grammar relative to the "
               "learned phonology");
@@ -910,12 +1040,57 @@ int main(int argc, char* argv[]) {
     // TODO(padril): is there a way to defer this?
     phones_file.close();
 
-    std::string observations_path = program.get<std::string>("--observations");
+    // Build edit transducer
+    {
+        auto s = edit_fst.AddState();
+        edit_fst.SetStart(s);
+        edit_fst.SetFinal(s, Semiring::One());
+
+        for (Label phoneme : phonemes.labels()) {
+            if (phoneme == phonemes.special("phi") ||
+                    phoneme == phonemes.special("start") ||
+                    phoneme == phonemes.special("end")) { continue; }
+            for (Label phone : phonemes.labels()) {
+            if (phone == phonemes.special("phi") ||
+                    phone == phonemes.special("start") ||
+                    phone == phonemes.special("end")) { continue; }
+                if (phoneme == phonemes.special("epsilon") &&
+                        phone == phonemes.special("epsilon")) { continue; }
+                edit_fst.AddArc(s, Arc(phoneme, phone, Semiring::One(), s));
+            }
+        }
+
+        edit_fst.AddArc(s, Arc(
+                    phonemes.special("start"), phonemes.special("start"),
+                    Semiring::One(), s));
+        edit_fst.AddArc(s, Arc(
+                    phonemes.special("end"), phonemes.special("end"),
+                    Semiring::One(), s));
+
+        fst::ArcSort(&edit_fst, fst::OLabelCompare<Arc>());
+    }
+
+    std::string alignments_path = program.get<std::string>("--alignments");
 
     size_t steps = program.get<size_t>("--steps");
     double alpha = program.get<double>("--alpha");
-    double universal_grammar_weight = program.get<double>(
-            "--universal-grammar-weight");
+
+    std::vector<std::string> ug_schedule_fields = split(
+            program.get<std::string>("--universal-grammar-schedule"), ':');
+    Schedule ug_schedule {
+        .boundary = std::stod(ug_schedule_fields[0]),
+        .interior = std::stod(ug_schedule_fields[1]),
+        .peak_step = std::stoul(ug_schedule_fields[2]),
+    };
+
+    std::vector<std::string> ident_schedule_fields = split(
+            program.get<std::string>("--identity-grammar-schedule"), ':');
+    Schedule ident_schedule {
+        .boundary = std::stod(ident_schedule_fields[0]),
+        .interior = std::stod(ident_schedule_fields[1]),
+        .peak_step = std::stoul(ident_schedule_fields[2]),
+    };
+
     size_t rebuild_stride = program.get<size_t>("--rebuild-stride");
 
     // TODO(padril): I don't know if this works
@@ -936,26 +1111,54 @@ int main(int argc, char* argv[]) {
     // }
     // transform(0, 0) = 0.3;
 
-    IFStream observations_file(observations_path, std::ios_base::in);
-    std::vector<Form> observations;
-    for (Text line; std::getline(observations_file, line);) {
+    IFStream alignments_file(alignments_path, std::ios_base::in);
+    std::vector<std::pair<Form, Form>> alignments;
+    // TODO(padril): handle quoted CSV reading, probably by using a library
+    Text header;
+    std::getline(alignments_file, header);
+    std::vector<Text> columns = split(header, ',');
+    if (columns != std::vector<Text>({"observation", "parameter", "status", "split"})) {
+        std::cerr << "Alignments file columns not formatted correctly.\n";
+        std::exit(1);
+    }
+    for (Text line; std::getline(alignments_file, line);) {
         // TODO(padril): This (and isomorphism) is not robust to end of line
         //               whitespace.
-        std::vector<Text> segments = split(line, ' ');
-        Form values;
-        if (!explicit_start) {
-            values.push_back(phonemes.special("start"));
+        std::vector<Text> fields = split(line, ',');
+        Text observation = fields[0];
+        Text parameter = fields[1];
+        Text status = fields[2];
+        if (status == "invisible") {
+            // TODO(padril)
+        } else if (status == "fixed") {
+            // TODO(padril)
+        } else if (status == "trainable") {
+            std::vector<Text> sr_segments = split(observation, ' ');
+            std::vector<Text> ur_segments = split(parameter, ' ');
+            Form sr_values;
+            Form ur_values;
+            if (!explicit_start) {
+                sr_values.push_back(phonemes.special("start"));
+                ur_values.push_back(phonemes.special("start"));
+            }
+            for (Text segment : sr_segments) {
+                sr_values.push_back(phonemes.encode(segment));
+            }
+            for (Text segment : ur_segments) {
+                ur_values.push_back(phonemes.encode(segment));
+            }
+            if (!explicit_end) {
+                sr_values.push_back(phonemes.special("end"));
+                ur_values.push_back(phonemes.special("end"));
+            }
+            alignments.push_back(std::pair(sr_values, ur_values));
+        } else {
+            std::cerr << "Unknown status in initial alignments.\n";
+            std::exit(1);
         }
-        for (Text segment : segments) {
-            values.push_back(phonemes.encode(segment));
-        }
-        if (!explicit_end) {
-            values.push_back(phonemes.special("end"));
-        }
-        observations.push_back(values);
     }
     // TODO(padril): is there a way to defer this?
-    observations_file.close();
+    alignments_file.close();
 
     // std::ofstream phones_out_file("phones_int.txt", std::ios_base::out);
     // for (Label label : phonemes.labels()) {
@@ -1030,15 +1233,38 @@ int main(int argc, char* argv[]) {
         make.MakeNGramModel();
     }
 
+    {
+        FST top;
+        for (auto [sr, ur] : alignments) {
+            fst::Union(&top, to_acceptor(alignemes, align_to_fst(ur, sr)));
+        }
+        fst::RmEpsilon(&top);
+        fst::Determinize(top, &top);
+
+        ngram::NGramCounter<NGramFST::Arc::Weight, Label> counter(1);
+        if (!counter.Count(top)) {
+            std::cerr << "Count n-gram FST (UG) could not be properly "
+                         "computed\n";
+        }
+
+        counter.GetFst(&ident_grammar);
+
+        Label backoff_label = alignemes.special("phi");
+        fst::ArcSort(&ident_grammar, fst::ILabelCompare<NGramFST::Arc>());
+        ngram::NGramKneserNey make(&ident_grammar, false, backoff_label);
+        // TODO(padril): look at the other options of this
+        // TODO(padril): maybe use ngram shrink
+        make.MakeNGramModel();
+    }
+
     std::cout << "Successfully constructed universal grammar.\n";
     std::cout << "Starting Gibbs sampling:\n";
 
-    Lexicon lexicon;
     std::ofstream dp_file(output_deltas_path, std::ios_base::out);
     std::ofstream ur_file(output_parameters_path, std::ios_base::out);
     gibbs_fst_dijkstra(
-            steps, engine, observations, ug, alignemes,
-            phonemes, alpha, universal_grammar_weight, rebuild_stride,
+            steps, engine, alignments, ug, alignemes,
+            phonemes, alpha, ug_schedule, ident_schedule, rebuild_stride,
             dp_file, ur_file, output_fsts_dir);
 
     std::cout << "Completed Gibbs sampling.\n";

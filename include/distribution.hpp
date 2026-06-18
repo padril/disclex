@@ -231,6 +231,10 @@ public:
         // to store counts and assignments instead
         for (Index j = 0; j < (Index) parameters.size(); ++j) {
             if (i == j) { continue; }
+            // We simply make the assumption that if the observation and
+            // parameter are not neighbours, they will have a very low
+            // likelihood. TODO(padril): find justification for this in the
+            // literature.
             if (!neighbours(observations[i], parameters[j])) { continue; }
             Semiring q_i_j = likelihood(observations[i], parameters[j]);
             bound += q_i_j;
