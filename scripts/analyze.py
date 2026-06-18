@@ -231,12 +231,24 @@ def main(args: list[str]):
 
     fig.savefig("prf.svg")
 
-    parray = np.array(ups[int(len(fs) * burnin):])
-    rarray = np.array(urs[int(len(fs) * burnin):])
-    farray = np.array(ufs[int(len(fs) * burnin):])
-    print(f'mean f = {farray.mean()} with std = {farray.std()}')
-    print(f'\tmean p (wnes) = {parray.mean()} with std = {parray.std()}')
-    print(f'\tmean r (iwnes) = {rarray.mean()} with std = {rarray.std()}')
+    parray = np.array(ps[int(len(ps) * burnin):])
+    rarray = np.array(rs[int(len(rs) * burnin):])
+    farray = np.array(fs[int(len(fs) * burnin):])
+    print(f'μ NES F = {farray.mean()} with σ = {farray.std()}')
+    print(f'\tμ WNES = {parray.mean()} with σ = {parray.std()}')
+    print(f'\tμ iWNES = {rarray.mean()} with σ = {rarray.std()}')
+    bparray = np.array(bin_ps[int(len(bin_ps) * burnin):])
+    brarray = np.array(bin_rs[int(len(bin_rs) * burnin):])
+    bfarray = np.array(bin_fs[int(len(bin_fs) * burnin):])
+    print(f'μ ≠ F = {bfarray.mean()} with σ = {bfarray.std()}')
+    print(f'\tμ W≠ = {bparray.mean()} with σ = {bparray.std()}')
+    print(f'\tμ iW≠ = {brarray.mean()} with σ = {brarray.std()}')
+    uparray = np.array(ups[int(len(ps) * burnin):])
+    urarray = np.array(urs[int(len(rs) * burnin):])
+    ufarray = np.array(ufs[int(len(fs) * burnin):])
+    print(f'μ Grouping F = {ufarray.mean()} with σ = {ufarray.std()}')
+    print(f'\tμ Grouping P = {uparray.mean()} with σ = {uparray.std()}')
+    print(f'\tμ Grouping R = {urarray.mean()} with σ = {urarray.std()}')
 
 if __name__ == '__main__':
     import sys
