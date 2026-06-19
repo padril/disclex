@@ -1,12 +1,12 @@
 from pathlib import Path
-import math
-from collections import Counter, defaultdict
-from itertools import combinations
+from collections import Counter, defaultdict, deque
+from itertools import combinations, tee
 from dataclasses import dataclass
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from Levenshtein import distance
+from typing import Generator, Iterable
 
 @dataclass
 class Delta:
@@ -20,7 +20,7 @@ type GroupingLexicon = set[tuple[str, str]]
 
 def make_deltas(surfaces_path: Path | str,
                 dp_updates_path: Path | str,
-                ur_indices_path: Path | str) -> list[Delta]:
+                ur_indices_path: Path | str) -> tuple[Generator[Delta], int]:
     surfaces = Path(surfaces_path).open('r').read()
     surfaces = surfaces.strip().split('\n')
     sr_dict = {}
@@ -36,13 +36,20 @@ def make_deltas(surfaces_path: Path | str,
         i, f_ = f
         ur_dict[int(i)] = f_
 
-    dp_updates = Path(dp_updates_path).open('r').read()
-    dp_updates = dp_updates.strip().split('\n')[1:]
-    dp_updates = [d.strip().split() for d in dp_updates]
-    dp_updates = [Delta(int(step), sr_dict[int(sr)], ur_dict[int(ur)], float(nlld))
-                  for _, step, sr, ur, nlld in dp_updates]
-
-    return dp_updates
+    # we intentionally don't close this so it doesn't go out of scope, and
+    # that should be okay since we only leak a single file
+    dp_updates = Path(dp_updates_path).open('r')
+    next(dp_updates)  # remove header
+    counting, yielding = tee(dp_updates)
+    n = sum(1 for _ in counting)
+    def gen():
+        for line in yielding:
+            _, step, sr_idx, ur_idx, nlld = line.strip().split()
+            yield Delta(int(step),
+                        sr_dict[int(sr_idx)],
+                        ur_dict[int(ur_idx)],
+                        float(nlld))
+    return gen(), n
 
 def parse_assignment_lexicon(file: Path | str) -> AssignmentLexicon:
     file = Path(file)
@@ -53,7 +60,10 @@ def parse_assignment_lexicon(file: Path | str) -> AssignmentLexicon:
         lex[sr] = ur
     return lex
 
-def write_best_lexicon(deltas: list[Delta], out_path: Path | str):
+def tail[T](it: Iterable[T], n: int):
+    return iter(deque(it, maxlen=n))
+
+def write_best_lexicon(deltas: Iterable[Delta], out_path: Path | str):
     counts: dict[str, Counter[str]] = {}
     for d in deltas:
         if d.observation not in counts:
@@ -88,36 +98,55 @@ def grouping_lexicon(assignments: AssignmentLexicon) -> GroupingLexicon:
 def ned(t: str, u: str):
     return distance(t, u) / max(len(t), len(u))
 
-def scores(ref: AssignmentLexicon, hyp: AssignmentLexicon, cluster_ned, class_ned):
+def scores(ref: AssignmentLexicon, hyp: AssignmentLexicon):
     # Precision as WNES
     clusters = defaultdict(list)
     for k_i, i in hyp.items(): clusters[i].append(k_i)
     wnes_num = 0
-    wnes_den = 0
+    wneq_num = 0
+    den = 0
     for k in clusters.values():
         if len(k) <= 1:
             continue
-        ned_i = sum(cluster_ned(t, u) for t, u in combinations(k, 2))
-        wnes_num += (len(k) / math.comb(len(k), 2)) * ned_i
-        wnes_den += len(k)
-    p = 1 - wnes_num / wnes_den
+        ned_i = 0
+        neq_i = 0
+        for t, u in combinations(k, 2):
+            ned_i += ned(t, u)
+            neq_i += ref[t] != ref[u]
+        n = len(k)
+        pairs = n * (n - 1) // 2
+        wnes_num += (n / pairs) * ned_i
+        wneq_num += (n / pairs) * neq_i
+        den += n
+    wnes = 1 - wnes_num / den
+    wneq = 1 - wneq_num / den
 
     # Recall as iWNES
     classes = defaultdict(list)
     for c_i, i in ref.items(): classes[i].append(hyp[c_i])
     iwnes_num = 0
-    iwnes_den = 0
+    iwneq_num = 0
+    iden = 0
     for c in classes.values():
         if len(c) <= 1:
             continue
-        ned_i = sum(class_ned(t, u) for t, u in combinations(c, 2))
-        iwnes_num += (len(c) / math.comb(len(c), 2)) * ned_i
-        iwnes_den += len(c)
-    r = 1 - iwnes_num / iwnes_den
+        ined_i = 0
+        ineq_i = 0
+        for t, u in combinations(c, 2):
+            ined_i += ned(t, u)
+            ineq_i += t != u
+        n = len(c)
+        pairs = n * (n - 1) // 2
+        iwnes_num += (n / pairs) * ined_i
+        iwneq_num += (n / pairs) * ineq_i
+        iden += n
+    iwnes = 1 - iwnes_num / iden
+    iwneq = 1 - iwneq_num / iden
 
-    f = 2 * (p * r) / (p + r) if not p == r == 0 else 0
+    nes_f = 2 * (wnes * iwnes) / (wnes + iwnes) if not wnes == iwnes == 0 else 0
+    neq_f = 2 * (wneq * iwneq) / (wneq + iwneq) if not wneq == iwneq == 0 else 0
 
-    return p, r, f
+    return wnes, iwnes, nes_f, wneq, iwneq, neq_f
 
 def scores_unweighted(ref: GroupingLexicon, hyp: GroupingLexicon):
     common = {(a, b) for (a, b) in ref if (a, b) in hyp or (b, a) in hyp}
@@ -131,73 +160,42 @@ def scores_unweighted(ref: GroupingLexicon, hyp: GroupingLexicon):
 def main(args: list[str]):
     surfaces, dp_updates, ur_indices, gold_lexicon = args
 
-    deltas = make_deltas(surfaces, dp_updates, ur_indices)
-    burnin = 0.5
-    write_best_lexicon(deltas[int(len(deltas) * burnin):], 'gibbs_lexicon.tsv')
+    deltas, n = make_deltas(surfaces, dp_updates, ur_indices)
+    burnin_ratio = 0.5
+    burnin = int(n * burnin_ratio)
+    writing, scoring = tee(deltas)
+    write_best_lexicon(tail(writing, burnin), 'gibbs_lexicon.tsv')
 
-    hyp_assignments = initial_assignment_lexicon(surfaces)
-    ref_assignments = parse_assignment_lexicon(gold_lexicon)
-    hyp = {k: v for k, v in hyp_assignments.items()
-                    if k in ref_assignments}
-    ref = {k: v for k, v in ref_assignments.items()
-                    if k in hyp_assignments}
+    hyp = initial_assignment_lexicon(surfaces)
+    ref = parse_assignment_lexicon(gold_lexicon)
+    hyp = {k: v for k, v in hyp.items() if k in ref}
+    ref = {k: v for k, v in ref.items() if k in hyp}
 
-    ps = []
-    rs = []
-    fs = []
-    temp_ps = []
-    temp_rs = []
-    temp_fs = []
-    bin_ps = []
-    bin_rs = []
-    bin_fs = []
-    temp_bin_ps = []
-    temp_bin_rs = []
-    temp_bin_fs = []
-    ups = []
-    urs = []
-    ufs = []
-    temp_ups = []
-    temp_urs = []
-    temp_ufs = []
+    # TODO(padril): renaming and reformatting for this whole file
+    ps, rs, fs = [], [], []
+    bps, brs, bfs = [], [], []
+    ups, urs, ufs = [], [], []
 
     current_step = 0
 
-    for delta in tqdm(deltas):
+    grouping_lexicon_ref = grouping_lexicon(ref)
+
+    for delta in tqdm(scoring, total=n):
         if delta.observation in hyp:
             hyp[delta.observation] = delta.sample
-        p, r, f = scores(ref, hyp, ned, ned)
-        temp_ps.append(p)
-        temp_rs.append(r)
-        temp_fs.append(f)
-        bp, br, bf = scores(ref, hyp, lambda t, u: ref[t] != ref[u], lambda t, u: t != u)
-        temp_bin_ps.append(bp)
-        temp_bin_rs.append(br)
-        temp_bin_fs.append(bf)
-        up, ur, uf = scores_unweighted(grouping_lexicon(ref), grouping_lexicon(hyp))
-        temp_ups.append(up)
-        temp_urs.append(ur)
-        temp_ufs.append(uf)
 
         if delta.step > current_step:
-            ps.append(sum(temp_ps) / len(temp_ps))
-            rs.append(sum(temp_rs) / len(temp_rs))
-            fs.append(sum(temp_fs) / len(temp_fs))
-            bin_ps.append(sum(temp_bin_ps) / len(temp_bin_ps))
-            bin_rs.append(sum(temp_bin_rs) / len(temp_bin_rs))
-            bin_fs.append(sum(temp_bin_fs) / len(temp_bin_fs))
-            ups.append(sum(temp_ups) / len(temp_ups))
-            urs.append(sum(temp_urs) / len(temp_urs))
-            ufs.append(sum(temp_ufs) / len(temp_ufs))
-            temp_ps = []
-            temp_rs = []
-            temp_fs = []
-            temp_bin_ps = []
-            temp_bin_rs = []
-            temp_bin_fs = []
-            temp_ups = []
-            temp_urs = []
-            temp_ufs = []
+            p, r, f, bp, br, bf = scores(ref, hyp)
+            up, ur, uf = scores_unweighted(grouping_lexicon_ref, grouping_lexicon(hyp))
+            ps.append(p)
+            rs.append(r)
+            fs.append(f)
+            bps.append(bp)
+            brs.append(br)
+            bfs.append(bf)
+            ups.append(up)
+            urs.append(ur)
+            ufs.append(uf)
             current_step = delta.step
 
     fig, (ax1, ax2, ax3) = plt.subplots(ncols=3, figsize=(16, 4))
@@ -211,9 +209,9 @@ def main(args: list[str]):
     labels = [str(line.get_label()) for line in lines]
     ax1.legend(lines, labels)
 
-    ax2.plot(bin_ps, label="Precision (W≠)")
-    ax2.plot(bin_rs, label="Recall (iW≠)")
-    ax2.plot(bin_fs, label="F-sore")
+    ax2.plot(bps, label="Precision (W≠)")
+    ax2.plot(brs, label="Recall (iW≠)")
+    ax2.plot(bfs, label="F-sore")
     ax2.set_ylim(-0.05, 1.05)
 
     lines = ax2.get_lines()
@@ -231,21 +229,21 @@ def main(args: list[str]):
 
     fig.savefig("prf.svg")
 
-    parray = np.array(ps[int(len(ps) * burnin):])
-    rarray = np.array(rs[int(len(rs) * burnin):])
-    farray = np.array(fs[int(len(fs) * burnin):])
+    parray = np.fromiter(tail(ps, burnin), dtype=float)
+    rarray = np.fromiter(tail(rs, burnin), dtype=float)
+    farray = np.fromiter(tail(fs, burnin), dtype=float)
     print(f'μ NES F = {farray.mean()} with σ = {farray.std()}')
     print(f'\tμ WNES = {parray.mean()} with σ = {parray.std()}')
     print(f'\tμ iWNES = {rarray.mean()} with σ = {rarray.std()}')
-    bparray = np.array(bin_ps[int(len(bin_ps) * burnin):])
-    brarray = np.array(bin_rs[int(len(bin_rs) * burnin):])
-    bfarray = np.array(bin_fs[int(len(bin_fs) * burnin):])
+    bparray = np.fromiter(tail(bps, burnin), dtype=float)
+    brarray = np.fromiter(tail(brs, burnin), dtype=float)
+    bfarray = np.fromiter(tail(bfs, burnin), dtype=float)
     print(f'μ ≠ F = {bfarray.mean()} with σ = {bfarray.std()}')
     print(f'\tμ W≠ = {bparray.mean()} with σ = {bparray.std()}')
     print(f'\tμ iW≠ = {brarray.mean()} with σ = {brarray.std()}')
-    uparray = np.array(ups[int(len(ps) * burnin):])
-    urarray = np.array(urs[int(len(rs) * burnin):])
-    ufarray = np.array(ufs[int(len(fs) * burnin):])
+    uparray = np.fromiter(tail(ups, burnin), dtype=float)
+    urarray = np.fromiter(tail(urs, burnin), dtype=float)
+    ufarray = np.fromiter(tail(ufs, burnin), dtype=float)
     print(f'μ Grouping F = {ufarray.mean()} with σ = {ufarray.std()}')
     print(f'\tμ Grouping P = {uparray.mean()} with σ = {uparray.std()}')
     print(f'\tμ Grouping R = {urarray.mean()} with σ = {urarray.std()}')
