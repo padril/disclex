@@ -143,9 +143,13 @@ std::string labels_to_string(
         const Labelling<Label, std::string, Special>& labelling
         ) noexcept {
     std::string result;
-    for (Label label : labels) {
-        result += labelling.decode(label);
+    if (labels.size() <= 0) {
+        return "";
     }
+    for (Label label : labels) {
+        result += labelling.decode(label) + ' ';
+    }
+    result.pop_back();  // remove the last space
     return result;
 }
 

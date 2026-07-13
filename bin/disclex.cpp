@@ -571,7 +571,7 @@ void gibbs_fst_dijkstra(
         double mh_ratio,
         std::ofstream& dp_file,
         std::ofstream& ur_file,
-        std::string fst_out_dir
+        std::string model_out_dir
         ) {
     enum class ParameterIndex    : size_t {};
     enum class ObservationIndex    : size_t {};
@@ -899,14 +899,22 @@ void gibbs_fst_dijkstra(
             parameter_model_compose_cache.clear();
             model_observation_compose_cache.clear();
 
-            std::string fst_out_path = fst_out_dir + "step_"
-                + std::to_string(step) + ".fst";
+            std::string model_out_path = model_out_dir + "step_"
+                + std::to_string(step) + ".csv";
             // TODO(padril): Do not pickle as a .fst, but rather as an
             //               alignment file (which should be standardized for
             //               the repo).
-            FST<Log, int> writable;
-            fst::ArcMap(*saved_models[transform], &writable, relabel_to_int<Log, Segment>);
-            writable.Write(fst_out_path);
+            std::ofstream model_out(model_out_path);
+            model_out << "parameter,observation,split\n";
+            for (auto [parameter, observation, split] : fst_assignments) {
+                auto parameter_labels = path_fst_to_labels(parameter).value();
+                auto parameter_string = labels_to_string(parameter_labels, phonemes);
+                auto observation_labels = path_fst_to_labels(observation).value();
+                auto observation_string = labels_to_string(observation_labels, phones);
+                model_out << parameter_string << ","
+                    << observation_string << ","
+                    << split << "\n";
+            };
         }
     }
 
@@ -1008,9 +1016,9 @@ int main(int argc, char* argv[]) {
     program.add_argument("--output-parameters")
         .required()
         .help("the file to output saved parameters to");
-    program.add_argument("--output-fsts-dir")
+    program.add_argument("--output-models-dir")
         .required()
-        .help("the directory to output saved FSTs to");
+        .help("the directory to output saved models to");
 
     try {
         program.parse_args(argc, argv);
@@ -1039,8 +1047,8 @@ int main(int argc, char* argv[]) {
         phonemes.associate_special("epsilon", epsilon_ident);
         phones.associate_special("epsilon", epsilon_ident);
     } else {
-        phonemes.associate_special("epsilon", "");
-        phones.associate_special("epsilon", "");
+        phonemes.associate_special("epsilon", "<eps>");
+        phones.associate_special("epsilon", "<eps>");
     }
     std::string phi_ident = program.get<std::string>("--phi");
     phonemes.special("phi");
@@ -1049,8 +1057,8 @@ int main(int argc, char* argv[]) {
         phonemes.associate_special("phi", phi_ident);
         phones.associate_special("phi", phi_ident);
     } else {
-        phonemes.associate_special("phi", "");
-        phones.associate_special("phi", "");
+        phonemes.associate_special("phi", "<phi>");
+        phones.associate_special("phi", "<phi>");
     }
     // TODO(padril): add start and end implicitly if they're unset
     std::string start_ident = program.get<std::string>("--start");
@@ -1063,8 +1071,8 @@ int main(int argc, char* argv[]) {
         phones.associate_special("start", start_ident);
     } else {
         explicit_start = false;
-        phonemes.associate_special("start", "");
-        phones.associate_special("start", "");
+        phonemes.associate_special("start", "<S>");
+        phones.associate_special("start", "<S>");
     }
     std::string end_ident = program.get<std::string>("--end");
     bool explicit_end;
@@ -1076,16 +1084,16 @@ int main(int argc, char* argv[]) {
         phones.associate_special("end", end_ident);
     } else {
         explicit_end = false;
-        phonemes.associate_special("end", "");
-        phones.associate_special("end", "");
+        phonemes.associate_special("end", "<E>");
+        phones.associate_special("end", "<E>");
     }
 
     std::string output_deltas_path = program.get<std::string>(
             "--output-deltas");
     std::string output_parameters_path = program.get<std::string>(
             "--output-parameters");
-    std::string output_fsts_dir = program.get<std::string>(
-            "--output-fsts-dir");
+    std::string model_out_dir = program.get<std::string>(
+            "--output-models-dir");
     // TODO(padril): safely check that each arg is in a reasonable range
     // TODO(padril): these should probably be unicode capable
     std::string phonemes_path = program.get<std::string>("--phonemes");
@@ -1262,7 +1270,7 @@ int main(int argc, char* argv[]) {
             alignments, splits,
             alignemes, phonemes, phones,
             alpha, rebuild_stride, self_align, mh_ratio,
-            dp_file, ur_file, output_fsts_dir
+            dp_file, ur_file, model_out_dir
             );
 
     std::cout << "Completed Gibbs sampling.\n";
