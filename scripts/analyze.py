@@ -118,8 +118,8 @@ def scores(ref: AssignmentLexicon, hyp: AssignmentLexicon):
         wnes_num += (n / pairs) * ned_i
         wneq_num += (n / pairs) * neq_i
         den += n
-    wnes = 1 - wnes_num / den
-    wneq = 1 - wneq_num / den
+    wnes = 1 - wnes_num / den if den != 0 else 0
+    wneq = 1 - wneq_num / den if den != 0 else 0
 
     # Recall as iWNES
     classes = defaultdict(list)
@@ -140,8 +140,8 @@ def scores(ref: AssignmentLexicon, hyp: AssignmentLexicon):
         iwnes_num += (n / pairs) * ined_i
         iwneq_num += (n / pairs) * ineq_i
         iden += n
-    iwnes = 1 - iwnes_num / iden
-    iwneq = 1 - iwneq_num / iden
+    iwnes = 1 - iwnes_num / iden if iden != 0 else 0
+    iwneq = 1 - iwneq_num / iden if iden != 0 else 0
 
     nes_f = 2 * (wnes * iwnes) / (wnes + iwnes) if not wnes == iwnes == 0 else 0
     neq_f = 2 * (wneq * iwneq) / (wneq + iwneq) if not wneq == iwneq == 0 else 0

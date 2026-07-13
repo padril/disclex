@@ -4,7 +4,7 @@
 #include <functional>
 #include <optional>
 #include <variant>
-#include "external/ctrack.hpp"
+#include <random>
 // TODO: Across the board, figure out what to mark as final
 
 namespace distribution {
@@ -16,7 +16,6 @@ public:
     virtual ~Distribution() = default;
     virtual std::pair<Value, Semiring> sample(Engine& engine, Given given) = 0;
 };
-
 
 // Distributions are functors of their Values
 template <typename ToValue, typename Semiring, typename Engine, typename Given, typename FromValue>
@@ -88,23 +87,16 @@ public:
     }
 };
 
-// TODO: Might not need this
-// template <typename Value, typename Semiring, typename Engine, typename Given, typename Method>
-// class CompositeDistribution : public Distribution<Value, Semiring, Engine, std::pair<Method, Given>> {
-// private:
-//     using Chosen = Distribution<Value, Semiring, Engine, Given>;
-//     using ChoiceFn = std::function<Chosen*(Method)>;
-//     ChoiceFn choice;
-// public:
-//     CompositeDistribution(ChoiceFn choice) : choice(choice) {};
-//     std::pair<Value, Semiring> sample(
-//             Engine& engine, std::pair<Method, Given> method_given) override {
-//         Method method;
-//         Given given;
-//         std::tie(method, given) = method_given;
-//         return choice(method)->sample(engine, given);
-//     }
-// };
+template <typename Value, typename Semiring, typename Engine>
+class Uniform : public distribution::Distribution<Value, Semiring, Engine, std::monostate> {
+private:
+    std::uniform_real_distribution<Value> uniform{0.0, 1.0};
+public:
+    Uniform() {}
+    std::pair<Value, Semiring> sample(Engine& engine, std::monostate = std::monostate()) override {
+        return std::pair(uniform(engine), Semiring::Zero());
+    }
+};
 
 // TODO: type erasure to make std::vector any iterator
 // TODO: is there something a little more generic than std::vector across the board?
@@ -131,44 +123,50 @@ public:
             // TODO: This is wrong, should be std::tie(s, p_i) = base->sample
             ret.push_back(base->sample(engine, given));
             p *= Semiring::One() - p_stop;
-        } while (ret.size() < max_length && std::get<Semiring>(uniform->sample(engine, std::monostate())) >= p_stop);
+        } while (ret.size() < max_length && uniform->sample(engine, std::monostate()).first >= p_stop);
         return std::pair(ret, p);
     }
 };
 
+// TODO(padril): this class needs a lot of renaming and formatting
 // TODO: a lot of private members are needed across the board
 template <
     typename Value,
     typename Semiring,
     typename Engine,
-    typename FST
+    typename ModelFST,
+    typename LeftFST,
+    typename RightFST
     >
-class FSTDistribution : public Distribution<Value, Semiring, Engine, std::pair<std::optional<FST>, std::optional<FST>>> {
+class FSTDistribution : public Distribution<Value, Semiring, Engine,
+    std::pair<std::optional<LeftFST>, std::optional<RightFST>>> {
 private:
-    using RandomWalkFn = std::function<std::pair<Value, Semiring>(Engine&, FST)>;
-    using ComposeFn = std::function<FST(FST, FST)>;
-    FST* fst;
+    using RandomWalkFn = std::function<std::pair<Value, Semiring>(Engine&, ModelFST)>;
+    using LeftComposeFn = std::function<ModelFST(LeftFST, ModelFST)>;
+    using RightComposeFn = std::function<ModelFST(ModelFST, RightFST)>;
+    ModelFST* fst;
     // This is `RandGen` in OpenFST, we'll use a RandGen + path sum
     RandomWalkFn random_walk;
     // This is `Compose` in OpenFST
-    ComposeFn compose;
+    LeftComposeFn left_compose;
+    RightComposeFn right_compose;
 public:
     FSTDistribution(
-            FST* fst,
+            ModelFST* fst,
             RandomWalkFn random_walk,
-            ComposeFn compose
-            ) : fst(fst), random_walk(random_walk), compose(compose) {};
+            LeftComposeFn left_compose,
+            RightComposeFn right_compose
+            ) : fst(fst), random_walk(random_walk), left_compose(left_compose), right_compose(right_compose) {};
     std::pair<Value, Semiring> sample(
             Engine& engine,
-            std::pair<std::optional<FST>, std::optional<FST>> given) override
+            std::pair<std::optional<LeftFST>, std::optional<RightFST>> given) override
     {
-        CTRACK;
-        FST fst_ = *fst;
+        ModelFST fst_ = *fst;
         if (given.first) {
-            fst_ = compose(given.first.value(), fst_);
+            fst_ = left_compose(given.first.value(), fst_);
         }
         if (given.second) {
-            fst_ = compose(fst_, given.second.value());
+            fst_ = right_compose(fst_, given.second.value());
         }
         return random_walk(engine, fst_);
     }
@@ -176,60 +174,60 @@ public:
 
 // See page 253 of Neal 2000a for how this works, and why certain variables
 // are named after greek letters
-template <
-    typename Parameter, typename Semiring, typename Engine, typename Index,
-    typename Observation, template <typename, typename> typename Map
-    >
-class CRPDirichletProcess : public Distribution<Parameter, Semiring, Engine, Index> {
+template <typename Parameter, typename Semiring, typename Engine,
+          typename Observation, typename UniformSemiring>
+class CRPDirichletProcess : public Distribution<Parameter, Semiring, Engine, size_t> {
 public:
     Distribution<Parameter, Semiring, Engine, Observation>* prior;  // G_0
 private:
     // TODO: do we have to use a pointer? or is reference fine? i don't remember
     Semiring alpha;
-    // TODO: make Map a better generic
-    // TODO: pair these into std::pair<Observation, Parameter>
-    Map<Index, Observation> observations;  // y
-    Map<Index, Parameter> parameters;      // theta
+    size_t n;
+    // TODO: genericize vector
+    std::vector<Observation> observations;  // y
+    std::vector<Parameter> parameters;      // theta
     std::function<Semiring(Observation, Parameter)> likelihood;  // F
     std::function<Semiring(Observation)> integrated_likelihood;  // the integral defining r_i
     std::function<bool(Observation, Parameter)> neighbours;  // Not mentioned in Neal, see metric DPs
-    Distribution<Semiring, std::monostate, Engine, std::monostate>* uniform;
+    Distribution<Semiring, UniformSemiring, Engine, std::monostate>* uniform;
 public:
     // TODO: there should be an alternative version that defines integrated
     // likelihood for you, under some circumstances
     CRPDirichletProcess(
             Distribution<Parameter, Semiring, Engine, Observation> *prior,
             Semiring alpha,
-            Map<Index, Observation> observations,
-            Map<Index, Parameter> initial_parameters,
+            std::vector<std::pair<Observation, Parameter>> initialization,
             std::function<Semiring(Observation, Parameter)> likelihood,
             std::function<Semiring(Observation)> integrated_likelihood,
             std::function<bool(Observation, Parameter)> neighbours,
-            Distribution<Semiring, std::monostate, Engine, std::monostate>* uniform
+            Distribution<Semiring, UniformSemiring, Engine, std::monostate>* uniform
             ) : prior(prior),
                 alpha(alpha),
-                observations(observations),
-                parameters(initial_parameters),
                 likelihood(likelihood),
                 integrated_likelihood(integrated_likelihood),
                 neighbours(neighbours),
                 uniform(uniform)
-            {}
+    {
+        n = initialization.size();
+        observations.resize(n);
+        parameters.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            std::tie(observations[i], parameters[i]) = initialization[i];
+        }
+    }
 
-    std::pair<Parameter, Semiring> sample(Engine& engine, Index i) override {
-        CTRACK;
+    std::pair<Parameter, Semiring> sample(Engine& engine, size_t i) override {
         // TODO: Likelihood temperature
-
         Semiring r_i = alpha * integrated_likelihood(observations[i]);
 
         Semiring bound = Semiring::Zero();
         // better than doing a division in the for loop
-        Semiring next = std::get<Semiring>(uniform->sample(engine, std::monostate())) * r_i;
+        Semiring next = uniform->sample(engine, std::monostate()).first * r_i;
 
         // NOTE: this is possibly optimizable, since our number of parameters
         // will be smaller than the number of indices, and we might be able
         // to store counts and assignments instead
-        for (Index j = 0; j < (Index) parameters.size(); ++j) {
+        for (size_t j = 0; j < n; ++j) {
             if (i == j) { continue; }
             // We simply make the assumption that if the observation and
             // parameter are not neighbours, they will have a very low
@@ -251,46 +249,46 @@ public:
         return std::pair(theta, p * (Semiring::One() - bound));
     }
 
-    void update(Index i, Parameter theta) {
+    void update(size_t i, Parameter theta) {
         parameters[i] = theta;
     }
 
-    Map<Index, Parameter> get_parameters() {
+    std::vector<Parameter> get_parameters() {
         return parameters;
     }
 };
 
-template <typename State, typename Semiring, typename Engine, typename Given>
+template <typename State, typename Semiring, typename Engine, typename Given, typename UniformSemiring>
 class MetropolisHastings : public Distribution<State, Semiring, Engine, Given> {
 private:
     State state;
     std::function<Semiring(State, Given)> stationary;
-    Distribution<State, std::pair<Semiring, Semiring>, Engine, State>* proposal;
-    Distribution<Semiring, std::monostate, Engine, std::monostate>* uniform;
+    Distribution<State, std::pair<Semiring, Semiring>, Engine, std::pair<State, Given>>* proposal;
+    Distribution<Semiring, UniformSemiring, Engine, std::monostate>* uniform;
 public:
     MetropolisHastings(
             State initial_state,
             std::function<Semiring(State, Given)> stationary,
-            Distribution<State, std::pair<Semiring, Semiring>, Engine, State>* proposal,
-            Distribution<Semiring, std::monostate, Engine, std::monostate>* uniform
+            Distribution<State, std::pair<Semiring, Semiring>, Engine, std::pair<State, Given>>* proposal,
+            Distribution<Semiring, UniformSemiring, Engine, std::monostate>* uniform
             ) : state(initial_state),
                 stationary(stationary),
                 proposal(proposal),
                 uniform(uniform)
             {}
 
-    std::pair<State, Semiring> sample(Engine& engine, Given given) {
+    std::pair<State, Semiring> sample(Engine& engine, Given given) override {
         State next;
         std::pair<Semiring, Semiring> forward_reverse;
         Semiring forward_p, reverse_p;
         std::tie(next, forward_reverse) =
-            proposal->sample(engine, state);
+            proposal->sample(engine, std::pair(state, given));
         std::tie(forward_p, reverse_p) = forward_reverse;
         Semiring curr_p = stationary(state, given);
         Semiring next_p = stationary(next, given);
         Semiring accept_p = std::min(
                 Semiring::One(), (next_p / curr_p) * (reverse_p / forward_p));
-        Semiring u = std::get<Semiring>(uniform->sample(engine, std::monostate()));
+        Semiring u = uniform->sample(engine, std::monostate()).first;
         if (u <= accept_p) {
             return std::pair(next, forward_p * accept_p);
         } else {

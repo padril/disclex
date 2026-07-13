@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 
 template <typename Label, typename Base, typename Special>
@@ -12,10 +13,18 @@ private:
     std::function<Label(Label)> next_label;
     std::unordered_map<Label, Base> map;
     std::unordered_map<Special, Label> specials;
+    std::unordered_set<Label> forced;
+    Label new_label() {
+        Label label = curr_label;
+        do {
+            label = next_label(label);
+        } while (forced.find(label) != forced.end());
+        return label;
+    }
 public:
     Labelling(Label first, std::function<Label(Label)> next)
         : curr_label(first), next_label(next) {}
-    Label encode(Base base) {
+    Label encode(const Base& base) {
         auto it = std::find_if(
                 map.begin(), map.end(),
                 [& base](const std::pair<Label, Base>& key){
@@ -26,24 +35,32 @@ public:
         }
         map[curr_label] = base;
         Label old_label = curr_label;
-        curr_label = next_label(curr_label);
+        curr_label = new_label();
         return old_label;
     }
-    Label special(Special special) {
+    Label special(const Special& special) {
         auto it = specials.find(special);
         if (it != specials.end()) {
             return it->second;
         }
         specials[special] = curr_label;
         Label old_label = curr_label;
-        curr_label = next_label(curr_label);
+        curr_label = new_label();
         return old_label;
     }
-    void associate_special(Special special, Base base) {
+    void associate_special(const Special& special, const Base& base) {
         map[specials[special]] = base;
     }
-    Base decode(Label label) {
-        return map[label];
+    void force(const Base& base, const Label& label) {
+        map[label] = base;
+        forced.insert(label);
+    }
+    void force_special(const Special& special, const Label& label) {
+        specials[special] = label;
+        forced.insert(label);
+    }
+    Base decode(const Label& label) const {
+        return map.at(label);
     }
     std::vector<Label> labels() {
         std::vector<Label> ret;

@@ -9,383 +9,352 @@
 #include <vector>
 #include <unordered_map>
 #include <deque>
+#include <algorithm>
 
 #include "distribution.hpp"
 #include "labelling.hpp"
+#include "utility.hpp"
+
+#include "impl/semiring.hpp"
+using namespace semiring;
 
 #include "external/argparse.hpp"
+#include "external/rapidcsv.hpp"
+#include "external/expected.hpp"
 #include <fst/fstlib.h>
+#include <fst/extensions/ngram/ngram-fst.h>
 #include <ngram/ngram.h>
 
 // #include "external/ctrack.hpp"
 
-// using Eigen::MatrixXd;
-
-using Label = int;
-using Char = char;
-using Text = std::string;
-using IFStream = std::basic_ifstream<Char>;
-using Semiring = fst::LogWeightTpl<float>;
+// TODO(padril): badness
 using Engine = std::default_random_engine;
-using Arc = fst::ArcTpl<Semiring, Label>;
-template <typename A>
-using FSTType = fst::VectorFst<A>;
-using FST = FSTType<Arc>;
-using NGramFST = fst::StdVectorFst;
-using Form = std::vector<Label>;
-using SR = FST;
-using UR = FST;
-using AR = FST;
-template <typename Index, typename Held>
-using LexiconMap = std::vector<Held>;
-using Lexicon = LexiconMap<int, std::pair<UR, Semiring>>;
 
-static FST edit_fst;
-static NGramFST ident_grammar;
-
-// Doing a lot of operator overloading allows the API to behave better when
-// we use the Semirings as we would doubles
-namespace fst {
-
-Semiring& operator+=(Semiring& a, Semiring b) {
-    a = fst::Plus(a, b);
-    return a;
-}
-
-Semiring operator+(Semiring a, Semiring b) {
-    a += b;
-    return a;
-}
-
-Semiring& operator-=(Semiring& a, Semiring b) {
-    a = fst::Minus(a, b);
-    return a;
-}
-
-Semiring operator-(Semiring a, Semiring b) {
-    a -= b;
-    return a;
-}
-
-Semiring& operator*=(Semiring& a, Semiring b) {
-    a = fst::Times(a, b);
-    return a;
-}
-
-Semiring operator*(Semiring a, Semiring b) {
-    a *= b;
-    return a;
-}
-
-Semiring& operator/=(Semiring& a, Semiring b) {
-    a = fst::Divide(a, b);
-    return a;
-}
-
-Semiring operator/(Semiring a, Semiring b) {
-    a /= b;
-    return a;
-}
-
-bool operator<(Semiring a, Semiring b) {
-    return a.Value() > b.Value();
-}
-
-bool operator<=(Semiring a, Semiring b) {
-    return a < b || a == b;
-}
-
-bool operator>(Semiring a, Semiring b) {
-    return !(a < b);
-}
-
-bool operator>=(Semiring a, Semiring b) {
-    return a > b || a == b;
-}
-
-};  // namespace fst
-
-class UniformSemiring : public distribution::Distribution<
-                        Semiring, std::monostate, Engine, std::monostate> {
- private:
-    std::uniform_real_distribution<Semiring::ValueType> uniform{0.0, 1.0};
- public:
-    UniformSemiring() {}
-    std::pair<Semiring, std::monostate> sample(
-            Engine& engine, std::monostate) override {
-        return std::pair(Semiring(-std::log(uniform(engine))),
-                std::monostate());
+#define DISTINCT_SEGMENT(Name) \
+    struct Name { \
+        int v; \
+        Name(int v = 0) : v(v) {} \
+        constexpr explicit operator int() const noexcept { return v; } \
+        constexpr explicit operator size_t() const noexcept { return v; } \
+        constexpr explicit operator bool() const noexcept { return v; } \
+        inline constexpr bool operator==(const Name& other) const noexcept { \
+            return v == other.v; \
+        } \
+        inline constexpr bool operator!=(const Name& other) const noexcept { \
+            return v != other.v; \
+        } \
+        inline constexpr bool operator>(const Name& other) const noexcept { \
+            return v > other.v; \
+        } \
+        inline constexpr bool operator<(const Name& other) const noexcept { \
+            return v < other.v; \
+        } \
+        inline constexpr bool operator<=(const Name& other) const noexcept { \
+            return v <= other.v; \
+        } \
+        inline constexpr bool operator>=(const Name& other) const noexcept { \
+            return v >= other.v; \
+        } \
+        bool Write(std::ostream&) const { return false; } \
+    }; \
+    namespace std { \
+        template <> \
+        struct hash<Name> { \
+            size_t operator()(const Name& s) const noexcept { \
+                return std::hash<int>{}(s.v); \
+            } \
+        }; \
+    } \
+    std::ostream& operator<<(std::ostream& os, const Name& name) { \
+        return os << name.v; \
     }
+
+template <typename T, typename U>
+struct VariantSegment {
+    int v;
+    VariantSegment(int v = 0) : v(v) {}
+    VariantSegment(const T& t) : v(t.v) {}
+    VariantSegment(const U& u) : v(u.v) {}
+    explicit operator T() const noexcept { return v; }
+    explicit operator U() const noexcept { return v; }
+    constexpr explicit operator int() const noexcept { return v; }
+    constexpr explicit operator size_t() const noexcept { return v; }
+    inline constexpr bool operator==(const VariantSegment<T, U>& other) const noexcept {
+        return v == other.v;
+    }
+    inline constexpr bool operator!=(const VariantSegment<T, U>& other) const noexcept {
+        return v != other.v;
+    }
+    inline constexpr bool operator>(const VariantSegment<T, U>& other) const noexcept {
+        return v > other.v;
+    }
+    inline constexpr bool operator<(const VariantSegment<T, U>& other) const noexcept {
+        return v < other.v;
+    }
+    inline constexpr bool operator>=(const VariantSegment<T, U>& other) const noexcept {
+        return v >= other.v;
+    }
+    inline constexpr bool operator<=(const VariantSegment<T, U>& other) const noexcept {
+        return v <= other.v;
+    }
+    bool Write(std::ostream&) const { return false; }
 };
 
-// TODO(padril): std library or boost might have something for this?
-std::vector<Text> split(const Text& s, Char delim) {
-    std::vector<Text> out;
-    std::size_t start = 0;
-
-    while (true) {
-        auto pos = s.find(delim, start);
-        if (pos == Text::npos) {
-            out.emplace_back(s.substr(start));
-            break;
+namespace std {
+    template <typename T, typename U>
+    struct hash<VariantSegment<T, U>> {
+        size_t operator()(const VariantSegment<T, U>& s) const noexcept {
+            return std::hash<int>{}(s.v);
         }
-        out.emplace_back(s.substr(start, pos - start));
-        start = pos + 1;
-    }
-
-    return out;
+    };
 }
 
-FST form_to_fst(Form form) {
-    FST fst;
-    auto state = fst.AddState();
-    fst.SetStart(state);
+DISTINCT_SEGMENT(Phoneme);
+DISTINCT_SEGMENT(Phone);
+DISTINCT_SEGMENT(Aligneme);
+using Segment = VariantSegment<Phoneme, Phone>;
 
-    for (Label phon : form) {
-        auto next = fst.AddState();
-        fst.AddArc(state, Arc(phon, phon, Semiring::One(), next));
-        state = next;
-    }
+// TODO(padril): should we also abstract std::vector to something else?
+// using Variable = std::vector<Segment>;  // In the sense of a random variable
+using Observation = std::vector<Phone>;
+using Parameter = std::vector<Phoneme>;
 
-    fst.SetFinal(state, Semiring::One());
-    return fst;
-}
+template <typename Semiring, typename Label>
+using FST = fst::VectorFst<fst::ArcTpl<Semiring, Label>>;
 
-FST align_to_fst(Form ur, Form sr) {
-    FST ar;
-    auto state = ar.AddState();
-    ar.SetStart(state);
+static FST<Log, Segment> edit_fst;  // The edit distance FST
 
-    for (size_t i = 0; i < ur.size(); ++i) {
-        auto next = ar.AddState();
-        ar.AddArc(state, Arc(ur[i], sr[i], Semiring::One(), next));
-        state = next;
-    }
-
-    ar.SetFinal(state, Semiring::One());
-    return ar;
-}
-
-Form fst_to_form(const FST& fst) {
-    Form form;
-
-    // fst::StdVectorFst trop_fst;
-    // fst::StdVectorFst best;
-    // fst::ArcMap(log_fst, &trop_fst, fst::LogToStdMapper());
-    // fst::ShortestPath(trop_fst, &best);
-
-    auto state = fst.Start();
-    if (state == fst::kNoStateId) return form;
-
-    // TODO(padril): This should return something different if the FST is
-    //               non-linear
-    // TODO(padril): arbitrary max_length
-    for (size_t i = 0; i < 30; ++i) {
-        if (fst.Final(state) != Semiring::Zero()) {
-            break;
-        }
-
-        fst::ArcIterator<FST> aiter(fst, state);
-
-        Arc arc = aiter.Value();
-        aiter.Next();
-
-        form.push_back(arc.ilabel);
-        state = arc.nextstate;
-    }
-
-    return form;
-}
+template <typename Semiring, typename From>
+static RelabelArcMapper<Semiring, From, int> relabel_to_int(
+    [](From ilabel, From olabel) -> std::pair<int, int> {
+        return std::pair(ilabel.v, olabel.v);
+    });
+template <typename Semiring, typename To>
+static RelabelArcMapper<Semiring, int, To> relabel_from_int(
+    [](int ilabel, int olabel) -> std::pair<To, To> {
+        return std::pair(To(ilabel), To(olabel));
+    });
 
 
-std::string display_form(
-        Form form, Labelling<Label, Text, Text>& labelling,
-        std::string lwrap = "",
-        std::string rwrap = "",
-        std::string end = "\n") {
-    std::string ret;
-    ret += lwrap;
-    for (Label segment : form) {
-        if (segment == labelling.special("epsilon")) {
-            continue;
-        }
-        ret += labelling.decode(segment);
-    }
-    ret += rwrap + end;
-    return ret;
-}
-
-template <typename A>
-fst::VectorFst<A> to_acceptor(
-        Labelling<Label, std::pair<Label, Label>, Text>& labelling,
-        fst::VectorFst<A> fst) {
-    fst::VectorFst<A> result;
-
-    for (fst::StateIterator<fst::VectorFst<A>> siter(fst);
-            !siter.Done(); siter.Next()) {
-        result.AddState();
-    }
-
-    result.SetStart(fst.Start());
-
-    for (fst::StateIterator<fst::VectorFst<A>> siter(fst);
-            !siter.Done(); siter.Next()) {
-        auto s = siter.Value();
-        if (fst.Final(s) != A::Weight::Zero()) {
-            result.SetFinal(s, A::Weight::One());  // keep weight 0, adjust if
-                                                   // needed
-        }
-
-        for (fst::ArcIterator<fst::VectorFst<A>> aiter(fst, s);
-                !aiter.Done(); aiter.Next()) {
-            auto a = aiter.Value();
-            Label label = labelling.encode(std::pair(a.ilabel, a.olabel));
-            result.AddArc(s, A(label, label, a.weight, a.nextstate));
-        }
-    }
-
+// TODO(padril): make mutable versions of many of these FST functions
+template <typename Semiring, template <typename, typename> typename Variant,
+          typename ILabel, typename OLabel>
+FST<Semiring, Variant<ILabel, OLabel>> compose(
+        const FST<Semiring, Variant<ILabel, OLabel>>& left,
+        const FST<Semiring, Variant<ILabel, OLabel>>& right
+        ) {
+    FST<Semiring, Variant<ILabel, OLabel>> result;
+    fst::Compose(left, right, &result);
     return result;
 }
 
-template <typename A>
-fst::VectorFst<A> from_acceptor(
-        Labelling<Label, std::pair<Label, Label>, Text>& labelling,
-        fst::VectorFst<A> fst) {
-    fst::VectorFst<A> result;
-
-    for (fst::StateIterator<fst::VectorFst<A>> siter(fst);
-            !siter.Done(); siter.Next()) {
-        result.AddState();
-    }
-
-    result.SetStart(fst.Start());
-
-    for (fst::StateIterator<fst::VectorFst<A>> siter(fst);
-            !siter.Done(); siter.Next()) {
-        auto s = siter.Value();
-        if (fst.Final(s) != A::Weight::Zero()) {
-            result.SetFinal(s, A::Weight::One());
-        }
-
-        for (fst::ArcIterator<fst::VectorFst<A>> aiter(fst, s);
-                !aiter.Done(); aiter.Next()) {
-            auto a = aiter.Value();
-            auto pair = labelling.decode(a.ilabel);
-            auto new_arc = A(pair.first, pair.second, a.weight, a.nextstate);
-            result.AddArc(s, new_arc);
-        }
-    }
-
+template <typename Semiring, template <typename, typename> typename Variant,
+          typename ILabel, typename OLabel>
+FST<Semiring, Variant<ILabel, OLabel>> compose(
+        const FST<Semiring, Variant<ILabel, OLabel>>& left,
+        const FST<Semiring, OLabel>& right
+        ) {
+    FST<Semiring, Variant<ILabel, OLabel>> result;
+    fst::Compose(left, cast_output_to_variant<Semiring, Variant, ILabel, OLabel>(right), &result);
     return result;
 }
 
-inline
-FST compose(const FST& left, const FST& right) {
-    FST ret;
-    fst::Compose(left, right, &ret);
-
-    return ret;
+template <typename Semiring, template <typename, typename> typename Variant,
+          typename ILabel, typename OLabel>
+FST<Semiring, Variant<ILabel, OLabel>> compose(
+        const FST<Semiring, ILabel>& left,
+        const FST<Semiring, Variant<ILabel, OLabel>>& right
+        ) {
+    FST<Semiring, Variant<ILabel, OLabel>> result;
+    fst::Compose(cast_input_to_variant<Semiring, Variant, ILabel, OLabel>(left), right, &result);
+    return result;
 }
 
-FST ngram_counts(
-        std::vector<SR> observations,
-        std::vector<UR> parameters,
-        NGramFST ug_model,
-        Labelling<Label, std::pair<Label, Label>, Text>& labelling,
-        double ug_weight,
-        double ident_weight,
-        bool self_align = false) {
-    // TODO(padril): Is this function actually correct?
-    //  - We might not be weighting more common alignments better
-    FST top;
+struct Alignment {
+    std::vector<std::pair<Phoneme, Phone>> alignment;
+    std::string split;
+};
 
-    // TODO(padril): better error handling than this
-    assert(observations.size() == parameters.size());
+enum class Status {
+    Invisible,
+    Fixed,
+    Trainable,
+};
 
-    // Semiring best(-std::numeric_limits<float>::infinity());
-    // Semiring worst = Semiring::Zero();
-
-    for (size_t i = 0; i < observations.size(); ++i) {
-        AR ar;
-        if (self_align) {
-            ar = parameters[i];
+struct Schedule {
+    double boundary;
+    double interior;
+    size_t peak_step;
+    size_t end_step;
+    double at_step(size_t step) {
+        if (step <= 0) {
+            return boundary;
+        } else if (0 < step && step <= peak_step) {
+            double delta = (interior - boundary) / peak_step;
+            return boundary + delta * step;
+        } else if (peak_step < step && step <= end_step) {
+            double delta = (interior - boundary) / (end_step - peak_step);
+            return interior - delta * (step - peak_step);
         } else {
-            SR sr = observations[i];
-            UR ur = parameters[i];
-            FST intermediate = compose(edit_fst, sr);
-            fst::ArcSort(&intermediate, fst::ILabelCompare<Arc>());
-            AR all_ars = compose(ur, intermediate);
-
-            fst::StdVectorFst trop_all_ars;
-            fst::StdVectorFst trop_ar;
-            fst::ArcMap(all_ars, &trop_all_ars, fst::LogToStdMapper());
-            fst::ShortestPath(trop_all_ars, &trop_ar);
-            fst::ArcMap(trop_ar, &ar, fst::StdToLogMapper());
+            return boundary;
         }
+    };
+};
 
-        fst::Union(&top, to_acceptor(labelling, ar));
-    }
+struct Split {
+    Status status;
+    Schedule mix;
+    size_t order;
+};
 
-    // std::cout << "\t\tMin alignment path count: e^" << -best.Value() << "\n";
-    // std::cout << "\t\tMax alignment path count: e^" << -worst.Value() << "\n";
+FST<Trop, int> ngrams_from_union(FST<Log, Aligneme> union_, Split split, Aligneme backoff_label) {
+    // The API requires that labels are ints for the purpose of counting
+    FST<Log, int> union_int;
+    fst::ArcMap(union_, &union_int, relabel_to_int<Log, Aligneme>);
+    fst::Determinize(union_int, &union_int);
+    fst::RmEpsilon(&union_int);
+    auto [mix, schedule, order] = split;
+    ngram::NGramCounter<Trop, int> counter(order);
+    counter.Count(union_int);
 
-    fst::RmEpsilon(&top);
-    fst::Determinize(top, &top);
+    FST<Trop, int> model_int;
+    counter.GetFst(&model_int);
 
-    // TODO(padril): generalize order
-    // TODO(padril): look into .AddSequence
-    ngram::NGramCounter<NGramFST::Arc::Weight, Label> counter(2);
-    if (!counter.Count(top)) {
-        std::cerr << "Count n-gram FST could not be properly computed\n";
-    }
-
-    NGramFST model;
-    counter.GetFst(&model);
-
-    // Must be one of:
-    // - kneser_ney
-    // - absolute
-    // - katz
-    // - witten_bell
-    // - unsmoothed
-    // - presmoothed
-    // TODO(padril): allow other smoothing methods
-    std::string method = "kneser_ney";
-
-    Label backoff_label = labelling.special("phi");
-    fst::ArcSort(&model, fst::ILabelCompare<NGramFST::Arc>());
-    ngram::NGramKneserNey make(&model, false, backoff_label);
+    // TODO(padril): decltype(...) a LOT more throughout the codebase
+    fst::ArcSort(&model_int, fst::ILabelCompare<decltype(model_int)::Arc>());
+    ngram::NGramKneserNey make(&model_int, false, int(backoff_label));
     // TODO(padril): look at the other options of this
     // TODO(padril): maybe use ngram shrink
-    make.MakeNGramModel();
+    if (!make.MakeNGramModel()) {
+        std::cerr << "Failed to make NGram model\n";
+    }
+    return model_int;
+}
 
-    ngram::NGramModelMerge merger(&model, backoff_label);
-    // TODO(padril): check if alpha is in the right order
-    merger.MergeNGramModels(ug_model, 1.0, ug_weight, true);
-    merger.MergeNGramModels(ident_grammar, 1.0, ident_weight, true);
+template <typename Label>
+FST<Log, Label> trop_to_log(FST<Trop, Label> trop) {
+    FST<Trop, int> trop_int;
+    fst::ArcMap(trop, &trop_int, relabel_to_int<Trop, Label>);
+    FST<Log, int> log_int;
+    fst::ArcMap(trop_int, &log_int, fst::StdToLogMapper());
+    FST<Log, Label> log;
+    fst::ArcMap(log_int, &log, relabel_from_int<Log, Label>);
+    return log;
+}
 
-    FST transform;
-    fst::ArcMap(model, &transform, fst::StdToLogMapper());
-    transform = from_acceptor(labelling, transform);
+template <typename Label>
+FST<Trop, Label> log_to_trop(FST<Log, Label> log) {
+    FST<Log, int> log_int;
+    fst::ArcMap(log, &log_int, relabel_to_int<Log, Label>);
+    FST<Trop, int> trop_int;
+    fst::ArcMap(log_int, &trop_int, fst::LogToStdMapper());
+    FST<Trop, Label> trop;
+    fst::ArcMap(trop_int, &trop, relabel_from_int<Trop, Label>);
+    return trop;
+}
 
-    Label phi = labelling.decode(backoff_label).first;
-    Label epsilon_epsilon = labelling.special("epsilon");
-    Label epsilon = labelling.decode(epsilon_epsilon).first;
+FST<Log, Segment> count_ngrams(
+        std::vector<std::tuple<FST<Log, Phoneme>, FST<Log, Phone>, std::string>> assignments,
+        std::unordered_map<std::string, Split> splits,
+        Labelling<Aligneme, std::pair<Phoneme, Phone>, std::string>& labelling,
+        size_t step,
+        bool self_align = false
+        ) {
+    // TODO(padril): Is this function actually correct?
+    //  - We might not be weighting more common alignments better
+    RelabelArcMapper<Log, Segment, Aligneme> transducer_to_acceptor(
+            [&labelling](Segment ilabel, Segment olabel
+                ) -> std::pair<Aligneme, Aligneme> {
+                Aligneme aligneme = labelling.encode(
+                        std::pair(Phoneme(ilabel), Phone(olabel)));
+                return std::pair(aligneme, aligneme);
+            });
+    RelabelArcMapper<Trop, Aligneme, Segment> acceptor_to_transducer(
+            [&labelling](Aligneme aligneme, Aligneme
+                ) -> std::pair<Segment, Segment> {
+                // TODO(padril): no check, but aligneme ilabel should eq olabel
+                return labelling.decode(aligneme);
+            });
+    RelabelArcMapper<Log, Phoneme, Segment> phoneme_to_segment(
+            [](Phoneme ilabel, Phoneme olabel) -> std::pair<Segment, Segment> {
+                return std::pair(ilabel, olabel);
+            });
+
+    std::unordered_map<std::string, FST<Log, Aligneme>> unions;
+
+    // TODO(padril): the invisible models should be generated ahead of time
+    for (const auto& [parameter, observation, split] : assignments) {
+        FST<Log, Segment> alignment;
+        if (self_align) {
+            fst::ArcMap(parameter, &alignment, phoneme_to_segment);
+        } else {
+            auto intermediate = compose(edit_fst, observation);
+            fst::ArcSort(&intermediate,
+                    fst::ILabelCompare<decltype(intermediate)::Arc>());
+            auto possible_alignments = compose(parameter, intermediate);
+
+            FST<Trop, Segment> trop_possible_alignments = log_to_trop(possible_alignments);
+            FST<Trop, Segment> trop_alignment;
+            fst::ShortestPath(trop_possible_alignments, &trop_alignment);
+            alignment = trop_to_log(trop_alignment);
+        }
+        FST<Log, Aligneme> alignment_acceptor;
+        fst::ArcMap(alignment, &alignment_acceptor, transducer_to_acceptor);
+        fst::Union(&unions[split], alignment_acceptor);
+    }
+
+
+    // TODO(padril): look into other smoothing options again
+    // TODO(padril): look into .AddSequence
+    double base_mix;
+    FST<Trop, int> acceptor_int;
+    Aligneme backoff_label = labelling.special("phi");
+    {
+        auto max = std::max_element(
+                unions.begin(), unions.end(),
+                [&](auto l, auto r) -> bool {
+                    auto [lsplit, lunion] = l;
+                    auto [rsplit, runion] = r;
+                    return splits[lsplit].order < splits[rsplit].order;
+                });
+        auto [split, union_] = *max;
+        unions.erase(max);
+        acceptor_int = ngrams_from_union(union_, splits[split], backoff_label);
+        base_mix = splits[split].mix.at_step(step);
+    }
+    ngram::NGramModelMerge merger(&acceptor_int, int(backoff_label));
+    for (auto [split, union_] : unions) {
+        auto model_int = ngrams_from_union(union_, splits[split], backoff_label);
+        // TODO(padril): check if mixing rations are in the right order
+        auto mix = splits[split].mix.at_step(step);
+        merger.MergeNGramModels(model_int, base_mix, mix, true);
+        base_mix = 1.0;
+    }
+
+    FST<Trop, Aligneme> acceptor;
+    fst::ArcMap(acceptor_int, &acceptor, relabel_from_int<Trop, Aligneme>);
+    FST<Trop, Segment> transform_trop;
+    fst::ArcMap(acceptor, &transform_trop, acceptor_to_transducer);
+    FST<Log, Segment> transform = trop_to_log(transform_trop);
+
+    Segment phi = labelling.decode(backoff_label).first;
+    Segment epsilon = labelling.decode(labelling.special("epsilon")).first;
     // Turn <phi>:<phi> transitions to <eps>:<eps>
     // This is the 'Approximate Offline Representation' mentioned in
     // Allauzen et al. 2005.
     // TODO(padril): Implement the 'Exact Offline Representation' as an option
     //               using ngram convert
-    for (fst::StateIterator<FST> siter(transform);
-            !siter.Done(); siter.Next()) {
-        FST::StateId state = siter.Value();
-        for (fst::MutableArcIterator<FST> aiter(&transform, state);
+    // TODO(padril): we can assume a lote more siter and aiter types
+    for (fst::StateIterator siter(transform); !siter.Done(); siter.Next()) {
+        auto state = siter.Value();
+        for (fst::MutableArcIterator aiter(&transform, state);
                 !aiter.Done(); aiter.Next()) {
-            Arc arc = aiter.Value();
-            if (arc.ilabel == phi) {
+            auto arc = aiter.Value();
+            // TODO(padril): should these be static casts everywhere? idk
+            if (Phoneme(arc.ilabel) == Phoneme(phi)) {
                 arc.ilabel = epsilon;
             }
-            if (arc.olabel == phi) {
+            if (Phone(arc.olabel) == Phone(phi)) {
                 arc.olabel = epsilon;
             }
             aiter.SetValue(arc);
@@ -396,33 +365,45 @@ FST ngram_counts(
     //               because of epsilon issues (or some other rounding
     //               accumulation) I think
 
-    fst::ArcSort(&transform, fst::OLabelCompare<Arc>());
+    fst::ArcSort(&transform, fst::OLabelCompare<decltype(transform)::Arc>());
     return transform;
 }
 
 // TODO(padril): may not need to pass as copy
-std::pair<FST, Semiring> random_walk(Engine& engine, FST fst, Label start, Label end) {
+// TODO(padril): should probably return two FSTs or need to be projected after
+template <typename Semiring, template <typename, typename> typename Variant,
+          typename ILabel, typename OLabel>
+std::pair<FST<Semiring, Variant<ILabel, OLabel>>, Semiring> random_walk(
+        Engine& engine, FST<Semiring, Variant<ILabel, OLabel>> fst,
+        ILabel istart, OLabel ostart, ILabel iend, OLabel oend
+        ) {
     // TODO(padril): might want to normalize using forward-backward first
-    UniformSemiring uniform;
+    distribution::MapValueDistribution uniform(
+            new distribution::Uniform<typename Semiring::ValueType, Semiring, Engine>(),
+            // TODO(padril): Semirings should be more general and have a way
+            //               to do this without specifying log semiring
+            std::function(real_to_log_semiring)
+            );
 
-    UR ur;
-    Semiring p = Semiring::One();
-    FST::StateId ur_curr = ur.AddState();
-    ur.SetStart(ur_curr);
+    FST<Semiring, Variant<ILabel, OLabel>> sampled;
+    auto p = Semiring::One();
+    auto sampled_curr = sampled.AddState();
+    sampled.SetStart(sampled_curr);
 
     // TODO(padril): fix this being needed to prevent the bug
     fst::RmEpsilon(&fst);
 
     // fst::RandGen does not return probability weights, so we need to write
     // this ourselves
-    FST::StateId curr = fst.Start();
-    for (fst::ArcIterator<FST> aiter(fst, curr); !aiter.Done(); aiter.Next()) {
-        Arc arc = aiter.Value();
-        if (arc.ilabel == start && arc.olabel == start) {
-            FST::StateId ur_next = ur.AddState();
-            auto new_arc = Arc( arc.ilabel, arc.ilabel, Semiring::One(), ur_next);
-            ur.AddArc(ur_curr, new_arc);
-            ur_curr = ur_next;
+    auto curr = fst.Start();
+    for (fst::ArcIterator aiter(fst, curr); !aiter.Done(); aiter.Next()) {
+        auto arc = aiter.Value();
+        if ((ILabel) arc.ilabel == istart && (OLabel) arc.olabel == ostart) {
+            auto sampled_next = sampled.AddState();
+            auto new_arc = typename decltype(sampled)::Arc(
+                    arc.ilabel, arc.ilabel, Semiring::One(), sampled_next);
+            sampled.AddArc(sampled_curr, new_arc);
+            sampled_curr = sampled_next;
             curr = arc.nextstate;
             break;
         }
@@ -437,39 +418,37 @@ std::pair<FST, Semiring> random_walk(Engine& engine, FST fst, Label start, Label
         //               idk
         Semiring final = fst.Final(curr);
         Semiring sum = final;
-        for (fst::ArcIterator<FST> aiter(fst, curr);
+        for (fst::ArcIterator aiter(fst, curr);
                 !aiter.Done(); aiter.Next()) {
-            Arc arc = aiter.Value();
+            auto arc = aiter.Value();
             sum += arc.weight;
         }
         Semiring bound = final;
-        Semiring next = std::get<Semiring>(
-                uniform.sample(engine, std::monostate())) * sum;
+        Semiring next = uniform.sample(engine, std::monostate()).first * sum;
         if (next <= bound) {  // Final probability got hit
             p *= bound;
-            ur.SetFinal(ur_curr, Semiring::One());
-            fst::ArcSort(&ur, fst::ILabelCompare<Arc>());
-            return std::pair(ur, p);
+            sampled.SetFinal(sampled_curr, Semiring::One());
+            fst::ArcSort(&sampled, fst::ILabelCompare<typename decltype(fst)::Arc>());
+            return std::pair(sampled, p);
         }
         if (next <= bound) {  // Final probability got hit
             p *= bound;
-            ur.SetFinal(ur_curr, Semiring::One());
-            fst::ArcSort(&ur, fst::ILabelCompare<Arc>());
-            return std::pair(ur, p);
+            sampled.SetFinal(sampled_curr, Semiring::One());
+            fst::ArcSort(&sampled, fst::ILabelCompare<typename decltype(fst)::Arc>());
+            return std::pair(sampled, p);
         }
         // Assume that the outgoing arcs are correctly set
-        for (fst::ArcIterator<FST> aiter(fst, curr);
-                !aiter.Done(); aiter.Next()) {
-            Arc arc = aiter.Value();
+        for (fst::ArcIterator aiter(fst, curr); !aiter.Done(); aiter.Next()) {
+            auto arc = aiter.Value();
             bound += arc.weight;
             if (next <= bound) {
-                FST::StateId ur_next = ur.AddState();
+                auto sampled_next = sampled.AddState();
                 // TODO(padril): idk if this should actually be Semiring::One()
-                auto new_arc = Arc(
-                        arc.ilabel, arc.ilabel, Semiring::One(), ur_next);
-                ur.AddArc(ur_curr, new_arc);
+                auto new_arc = typename decltype(sampled)::Arc(
+                        arc.ilabel, arc.ilabel, Semiring::One(), sampled_next);
+                sampled.AddArc(sampled_curr, new_arc);
                 p *= arc.weight;
-                ur_curr = ur_next;
+                sampled_curr = sampled_next;
                 curr = arc.nextstate;
                 break;
             }
@@ -477,20 +456,27 @@ std::pair<FST, Semiring> random_walk(Engine& engine, FST fst, Label start, Label
     }
     // Hit max length
     {
-        FST::StateId ur_next = ur.AddState();
-        auto new_arc = Arc( end, end, Semiring::One(), ur_next);
-        ur.AddArc(ur_curr, new_arc);
-        ur_curr = ur_next;
+        auto sampled_next = sampled.AddState();
+        // TODO(padril): all of these auto new_arc's have a better form of Type ident(...);
+        auto new_arc = typename decltype(sampled)::Arc(
+                iend, oend, Semiring::One(), sampled_next);
+        sampled.AddArc(sampled_curr, new_arc);
+        sampled_curr = sampled_next;
     }
-    ur.SetFinal(ur_curr, Semiring::One());
-    fst::ArcSort(&ur, fst::ILabelCompare<Arc>());
-    return std::pair(ur, p);
+    sampled.SetFinal(sampled_curr, Semiring::One());
+    fst::ArcSort(&sampled, fst::ILabelCompare<typename decltype(sampled)::Arc>());
+    return std::pair(sampled, p);
 }
 
-Semiring likelihood(FST fst, SR sr, UR ur) {
-    FST intermediate = compose(fst, sr);
-    fst::ArcSort(&intermediate, fst::ILabelCompare<Arc>());
-    FST composed = compose(ur, intermediate);
+template <typename Semiring, template <typename, typename> typename Variant,
+          typename ILabel, typename OLabel>
+Semiring likelihood(FST<Semiring, Variant<ILabel, OLabel>> model,
+                    FST<Semiring, OLabel> observation,
+                    FST<Semiring, ILabel> parameter) {
+    FST<Semiring, Variant<ILabel, OLabel>> intermediate = compose(model, observation);
+    fst::ArcSort(&intermediate, fst::ILabelCompare<typename decltype(intermediate)::Arc>());
+    // TODO(padril): I think we want to use the lazy compose for ur o inter
+    auto composed = compose(parameter, intermediate);
     std::vector<Semiring> dists;
     fst::ShortestDistance(composed, &dists, true);
     return static_cast<size_t>(composed.Start()) < dists.size() ?
@@ -509,7 +495,8 @@ struct HashPair {
 
 // Slightly modified version of the code from @guilhermeagostinelli on github,
 // though this is a standard algorithm.
-int levenshtein(Form form1, Form form2) {
+template <typename T, typename U>
+int levenshtein(std::vector<T> form1, std::vector<U> form2) {
     int size1 = form1.size();
     int size2 = form2.size();
     std::vector<std::vector<int>> verif(size1 + 1, std::vector<int>(size2 + 1));
@@ -534,7 +521,7 @@ int levenshtein(Form form1, Form form2) {
         for (int j = 1; j <= size2; j++) {
             // Sets the modification cost.
             // 0 means no modification (i.e. equal letters) and 1 means that a modification is needed (i.e. unequal letters).
-            int cost = (form2[j - 1] == form1[i - 1]) ? 0 : 1;
+            int cost = (int(form2[j - 1]) == int(form1[i - 1])) ? 0 : 1;
 
             // Sets the current position of the matrix as the minimum value between a (deletion), b (insertion) and c (substitution).
             // a = the upper adjacent value plus 1: verif[i - 1][j] + 1
@@ -551,200 +538,256 @@ int levenshtein(Form form1, Form form2) {
     return verif[size1][size2];
 }
 
-struct Schedule {
-    double boundary;
-    double interior;
-    size_t peak_step;
+
+template <typename T, typename Index>
+class StrongDeque {
+private:
+    std::deque<T> data;
+public:
+    T& operator[](Index i) {
+        return data[static_cast<size_t>(i)];
+    }
+    const T& operator[](Index i) const {
+        return data[static_cast<size_t>(i)];
+    }
+    void push_back(const T& x) {
+        data.push_back(x);
+    }
+    std::size_t size() const {
+        return data.size();
+    }
 };
 
-// TODO(padril): split Form into UR and SR forms?
-// and maybe better name SR and UR
 void gibbs_fst_dijkstra(
         size_t steps, Engine engine,
-        std::vector<std::pair<Form, Form>> initial_alignment,
-        NGramFST ug_counts,
-        Labelling<Label, std::pair<Label, Label>, Text>& alignemes,
-        Labelling<Label, Text, Text>& phonemes,
-        Semiring alpha,
-        Schedule ug_sched,
-        Schedule ident_sched,
+        std::vector<Alignment> alignments,
+        std::unordered_map<std::string, Split> splits,
+        Labelling<Aligneme, std::pair<Phoneme, Phone>, std::string>& alignemes,
+        Labelling<Phoneme, std::string, std::string>& phonemes,
+        Labelling<Phone, std::string, std::string>& phones,
+        Log alpha,
         size_t rebuild_every,
         bool self_align,
+        double mh_ratio,
         std::ofstream& dp_file,
         std::ofstream& ur_file,
-        std::string fst_out_dir) {
-    using Index = int;
+        std::string fst_out_dir
+        ) {
+    enum class ParameterIndex    : size_t {};
+    enum class ObservationIndex    : size_t {};
+    enum class ModelIndex : size_t {};
 
-    double ug_weight = ug_sched.boundary;
-    double ug_delta = (ug_sched.interior - ug_sched.boundary)
-        / ug_sched.peak_step;
-    double ident_weight = ident_sched.boundary;
-    double ident_delta = (ident_sched.interior - ident_sched.boundary)
-        / ident_sched.peak_step;
+    struct Assignment {
+        ParameterIndex parameter;
+        ObservationIndex observation;
+        std::string split;
+    };
+    
+    std::unordered_map<std::string, double> weights;
+    for (const auto& [name, split] : splits) {
+        weights[name] = split.mix.boundary;
+   }
 
     // TODO(padril): This gets massive. A custom implementation may be better.
     // TODO(padril): switch to unique_ptr across the repo
     // TODO(padril): several of the new FST(...) new UR(...) new SR(...) lines
     //               would be better if we passed an output fst parameter
-    std::deque<FST*> saved_fsts;
+    // TODO(padril): might be more explanatory to have Segment as just
+    //               Variant<Phoneme, Phone>
+    StrongDeque<FST<Log, Phoneme>*, ParameterIndex> saved_parameters;
+    StrongDeque<FST<Log, Phone>*, ObservationIndex> saved_observations;
+    StrongDeque<FST<Log, Segment>*, ModelIndex> saved_models;
+    auto transform = ModelIndex(saved_models.size());
+    saved_models.push_back(new FST<Log, Segment>());
 
-    saved_fsts.push_back(new FST());
-    Index ngram = saved_fsts.size() - 1;
+    std::vector<Assignment> assignments;
+    for (const auto& [alignment, split] : alignments) {
+        auto [parameter, observation] = unzip(alignment);
 
-    // TODO(padril): Lexicon should be its own abstraction
-    std::vector<Index> observations;
-    std::vector<Index> initial_parameters;
-    for (auto [sr, ur] : initial_alignment) {
-        SR* sr_fst = new SR(form_to_fst(sr));
-        UR* ur_fst = new UR(form_to_fst(ur));
-        saved_fsts.push_back(sr_fst);
-        observations.push_back(saved_fsts.size() - 1);
-        saved_fsts.push_back(ur_fst);
-        initial_parameters.push_back(saved_fsts.size() - 1);
+        auto parameter_fst = new auto(labels_to_path_fst<Log, Phoneme>(parameter));
+        auto parameter_index = ParameterIndex(saved_parameters.size());
+        saved_parameters.push_back(parameter_fst);
+
+        auto observation_fst = new auto(labels_to_path_fst<Log, Phone>(observation));
+        auto observation_index = ObservationIndex(saved_observations.size());
+        saved_observations.push_back(observation_fst);
+        
+        assignments.push_back(Assignment {
+                parameter_index,
+                observation_index,
+                split,
+                });
     }
-    std::cout << "\tCompleted initial alignment.\n";
 
-    UniformSemiring uniform;
+    // TODO(padril): some noexcepts should be added around the codebase
 
-    std::unordered_map<std::pair<Index, Index>, Semiring, HashPair>
+    distribution::MapValueDistribution uniform(
+            new distribution::Uniform<Log::ValueType, Log, Engine>(),
+            std::function(real_to_log_semiring)
+            );
+
+    // TODO(padril): could be std::tuple<Model, SR, UR>
+    std::unordered_map<std::pair<ObservationIndex, ParameterIndex>, Log, HashPair>
         likelihood_cache;
-    std::unordered_map<std::pair<Index, Index>, Index, HashPair>
-        compose_cache;
+    std::unordered_map<std::pair<ParameterIndex, ModelIndex>, ModelIndex, HashPair>
+        parameter_model_compose_cache;
+    std::unordered_map<std::pair<ModelIndex, ObservationIndex>, ModelIndex, HashPair>
+        model_observation_compose_cache;
+
+    // TODO(padril): these lambdas should probably have explicit captures
+    //               but right now, they'd be too large. small refactor.
 
     distribution::MapGivenDistribution<
-        Index, Semiring, Engine, Index,
-        std::pair<std::optional<Index>, std::optional<Index>>> prior(
-        new distribution::FSTDistribution<Index, Semiring, Engine, Index>(
-            &ngram,
-            [&saved_fsts, &phonemes](
-                Engine& engine, Index fst) -> std::pair<Index, Semiring> {
-                UR* ur = new UR();
-                Semiring p;
-                std::tie(*ur, p) = random_walk(engine, *saved_fsts[fst],
-                        phonemes.special("start"), phonemes.special("end"));
-                saved_fsts.push_back(ur);
-                return std::pair(saved_fsts.size() - 1, p);
+        ParameterIndex, Log, Engine, ObservationIndex,
+        std::pair<std::optional<ParameterIndex>, std::optional<ObservationIndex>>
+        > prior(
+        new distribution::FSTDistribution<ParameterIndex, Log, Engine, ModelIndex, ParameterIndex, ObservationIndex>(
+            &transform,
+            [&](Engine& engine, ModelIndex i) -> std::pair<ParameterIndex, Log> {
+                auto [alignment,  p] = random_walk(
+                        engine, *saved_models[i],
+                        phonemes.special("start"), phones.special("start"),
+                        phonemes.special("end"), phones.special("end")
+                        );
+
+                auto parameter = new FST<Log, Phoneme>;
+                *parameter = project_input(alignment);
+                auto parameter_index = ParameterIndex(saved_parameters.size());
+                saved_parameters.push_back(parameter);
+                return std::pair(parameter_index, p);
             },
-            [&saved_fsts, &compose_cache](Index left, Index right) -> Index {
-                auto it = compose_cache.find(std::pair(left, right));
-                if (it != compose_cache.end()) {
+            [&](ParameterIndex parameter, ModelIndex model) -> ModelIndex {
+                auto it = parameter_model_compose_cache.find(std::pair(parameter, model));
+                if (it != parameter_model_compose_cache.end()) {
                     return it->second;
                 }
-                FST* composed_fst = new FST(
-                        compose(*saved_fsts[left], *saved_fsts[right]));
-                saved_fsts.push_back(composed_fst);
-                Index composed = saved_fsts.size() - 1;
-                compose_cache[std::pair(left, right)] = composed;
-                return composed;
+                auto composed = new auto( compose(*saved_parameters[parameter], *saved_models[model]));
+                auto composed_index = ModelIndex(saved_models.size());
+                saved_models.push_back(composed);
+                parameter_model_compose_cache[std::pair(parameter, model)] = composed_index;
+                return composed_index;
+            },
+            [&](ModelIndex model, ObservationIndex observation) -> ModelIndex {
+                auto it = model_observation_compose_cache.find(std::pair(model, observation));
+                if (it != model_observation_compose_cache.end()) {
+                    return it->second;
+                }
+                auto composed = new auto(compose(*saved_models[model], *saved_observations[observation]));
+                auto composed_index = ModelIndex(saved_models.size());
+                saved_models.push_back(composed);
+                model_observation_compose_cache[std::pair(model, observation)] = composed_index;
+                return composed_index;
             }),
-        [](Index sr) {
-            return std::pair(std::nullopt, sr);
+        [](ObservationIndex observation) {
+            return std::pair(std::nullopt, observation);
         });
 
     int likelihood_hits;
     int likelihood_misses;
 
-    // TODO(padril): LexiconMap is poorly named
-    distribution::CRPDirichletProcess<
-        Index, Semiring, Engine, Index, Index, LexiconMap> dp(
+    std::vector<std::pair<ObservationIndex, ParameterIndex>> dp_initialization;
+    for (auto [parameter, observation, split] : assignments) {
+        if (splits[split].status != Status::Invisible) {
+            dp_initialization.push_back(std::pair(observation, parameter));
+        }
+    }
+
+    distribution::CRPDirichletProcess<ParameterIndex, Log, Engine, ObservationIndex, Log> dp(
             &prior,
             alpha,
-            observations,
-            initial_parameters,
-            [&saved_fsts, &likelihood_cache, &ngram, &likelihood_hits, &likelihood_misses](
-                Index sr, Index ur) -> Semiring {
-                auto it = likelihood_cache.find(std::pair(sr, ur));
+            dp_initialization,
+            [&](ObservationIndex observation, ParameterIndex parameter) -> Log {
+                auto it = likelihood_cache.find(
+                        std::pair(observation, parameter));
                 if (it != likelihood_cache.end()) {
                     ++likelihood_hits;
                     return it->second;
                 }
                 ++likelihood_misses;
-                Semiring l = likelihood(
-                        *saved_fsts[ngram], *saved_fsts[sr], *saved_fsts[ur]);
-                likelihood_cache[std::pair(sr, ur)] = l;
+                auto l = likelihood(*saved_models[transform],
+                                    *saved_observations[observation],
+                                    *saved_parameters[parameter]);
+                likelihood_cache[std::pair(observation, parameter)] = l;
                 return l;
             },
-            [&saved_fsts, &compose_cache, &ngram](Index sr) -> Semiring {
+            [&](ObservationIndex observation) -> Log {
                 // TODO(padril): cache this as well
-                FST* composed_fst;
-                auto it = compose_cache.find(std::pair(ngram, sr));
-                if (it != compose_cache.end()) {
-                    composed_fst = saved_fsts[it->second];
+                FST<Log, Segment>* composed_fst;
+                auto it = model_observation_compose_cache.find(
+                        std::pair(transform, observation));
+                if (it != model_observation_compose_cache.end()) {
+                    composed_fst = saved_models[it->second];
                 } else {
-                    composed_fst = new FST(
-                            compose(*saved_fsts[ngram], *saved_fsts[sr]));
-                    saved_fsts.push_back(composed_fst);
-                    Index composed = saved_fsts.size() - 1;
-                    compose_cache[std::pair(ngram, sr)] = composed;
+                    composed_fst = new auto(
+                            compose(*saved_models[transform],
+                            *saved_observations[observation])
+                            );
+                    saved_models.push_back(composed_fst);
+                    auto composed = ModelIndex(saved_models.size() - 1);
+                    model_observation_compose_cache[std::pair(transform, observation)] = composed;
                 }
-                std::vector<Semiring> dists;
+                std::vector<Log> dists;
                 // TODO(padril): make shortestdistance gracefully exit when no
                 //               dists found
                 fst::ShortestDistance(*composed_fst, &dists, true);
                 return static_cast<size_t>(composed_fst->Start()) < dists.size() ?
-                    dists[composed_fst->Start()] : Semiring::Zero();
+                    dists[composed_fst->Start()] : Log::Zero();
             },
-            [&saved_fsts, &phonemes, &uniform, &engine](Index sr, Index ur) -> bool {
-                Form sr_form = fst_to_form(*saved_fsts[sr]);
-                sr_form.erase(
+            [&](ObservationIndex observation, ParameterIndex parameter) -> bool {
+                Parameter parameter_form = path_fst_to_labels(*saved_parameters[parameter]).value();
+                parameter_form.erase(
                         std::remove_if(
-                            sr_form.begin(),
-                            sr_form.end(),
-                            [&phonemes](Label x) -> bool {
+                            parameter_form.begin(),
+                            parameter_form.end(),
+                            [&](Phoneme x) -> bool {
                                 return x == phonemes.special("epsilon");
                             }),
-                        sr_form.end());
-                Form ur_form = fst_to_form(*saved_fsts[ur]);
-                ur_form.erase(
+                        parameter_form.end());
+                Observation observation_form = path_fst_to_labels(*saved_observations[observation]).value();
+                observation_form.erase(
                         std::remove_if(
-                            ur_form.begin(),
-                            ur_form.end(),
-                            [&phonemes](Label x) -> bool {
-                                return x == phonemes.special("epsilon");
+                            observation_form.begin(),
+                            observation_form.end(),
+                            [&](Phone x) -> bool {
+                                return x == phones.special("epsilon");
                             }),
-                        ur_form.end());
-                Semiring soft_p(-std::log(0.01));
-                Semiring soft_sample = std::get<Semiring>(
-                        uniform.sample(engine, std::monostate()));
-                return levenshtein(sr_form, ur_form) <= 3
+                        observation_form.end());
+                // TODO(padril): make this a parameter, and do it better
+                Log soft_p = real_to_log_semiring(0.01);
+                Log soft_sample = uniform.sample(engine, std::monostate()).first;
+                return levenshtein(observation_form, parameter_form) <= 3
                     || soft_sample <= soft_p;
-                // return true;  // Default full-conditional behaviour
+                // retparametern true;  // Default full-conditional behavioparameter
             },
             &uniform);
-
-    std::vector<UR> fst_parameters;
-    for (Index i : dp.get_parameters()) {
-        fst_parameters.push_back(*saved_fsts[i]);
-    }
-
-    std::vector<UR> fst_observations;
-    for (Index i : observations) {
-        fst_observations.push_back(*saved_fsts[i]);
-    }
 
     // TODO: This can be abstracted, like Uniform, and moved to distributions.hpp
     class UniformProposal :
         public distribution::Distribution<
-            Index, std::pair<Semiring, Semiring>, Engine, Index> {
+            ParameterIndex, std::pair<Log, Log>, Engine, std::pair<ParameterIndex, std::pair<ObservationIndex, size_t>>> {
     private:
         distribution::CRPDirichletProcess<
-            Index, Semiring, Engine, Index, Index, LexiconMap>* dp;
+            ParameterIndex, Log, Engine, ObservationIndex, Log>* dp;
     public:
         UniformProposal(
             distribution::CRPDirichletProcess<
-                Index, Semiring, Engine, Index, Index, LexiconMap>* dp
+                ParameterIndex, Log, Engine, ObservationIndex, Log>* dp
                 ) : dp(dp) {};
-        std::pair<Index, std::pair<Semiring, Semiring>> sample(Engine& engine, Index given) {
-            LexiconMap<int, Index> parameters = dp->get_parameters();
+        std::pair<ParameterIndex, std::pair<Log, Log>> sample(
+                Engine& engine,
+                std::pair<ParameterIndex, std::pair<ObservationIndex, size_t>> given
+                ) {
+            ObservationIndex sr = given.second.first;
+            std::vector<ParameterIndex> parameters = dp->get_parameters();
             int n = parameters.size();
             std::uniform_int_distribution<int> uniform_pos{0, n};
             int pos = uniform_pos(engine);
-            Semiring p = Semiring(-std::log(1.0 / n));
+            Log p = real_to_log_semiring(1.0 / n);
             if (pos < n) {
                 return std::pair(parameters[pos], std::pair(p, p));
             } else {
                 return std::pair(
-                        std::get<Index>(dp->prior->sample(engine, given)),
+                        std::get<ParameterIndex>(dp->prior->sample(engine, sr)),
                         std::pair(p, p));
             }
             
@@ -752,32 +795,41 @@ void gibbs_fst_dijkstra(
     };
 
     // For Metropolis-within-Gibbs
-    distribution::MetropolisHastings<Index, Semiring, Engine, std::pair<Index, int>> mh(
-            0,
-            [&saved_fsts, &likelihood_cache, &ngram, &likelihood_hits, &likelihood_misses](
-                Index ur, std::pair<Index, int> sr_count) -> Semiring {
-                Index sr;
-                int count;
-                std::tie(sr, count) = sr_count;
-                auto it = likelihood_cache.find(std::pair(sr, ur));
+    distribution::MetropolisHastings<ParameterIndex, Log, Engine, std::pair<ObservationIndex, size_t>, Log> mh(
+            ParameterIndex(0),
+            [&](ParameterIndex parameter, std::pair<ObservationIndex, size_t> observation_count) -> Log {
+                auto [observation, count] = observation_count;
+                auto it = likelihood_cache.find(std::pair(observation, parameter));
                 if (it != likelihood_cache.end()) {
                     ++likelihood_hits;
                     return it->second;
                 }
                 ++likelihood_misses;
-                Semiring l = likelihood(
-                        *saved_fsts[ngram], *saved_fsts[sr], *saved_fsts[ur]);
-                likelihood_cache[std::pair(sr, ur)] = l;
-                return Semiring(-std::log(count)) * l;
+                Log l = likelihood(
+                        *saved_models[transform], *saved_observations[observation], *saved_parameters[parameter]);
+                likelihood_cache[std::pair(observation, parameter)] = l;
+                return real_to_log_semiring(count) * l;
             },
             new UniformProposal(&dp),
             &uniform
             );
 
 
-    saved_fsts[ngram] = new FST(
-            ngram_counts(fst_observations, fst_parameters, ug_counts, alignemes, ug_weight, ident_weight, self_align));
-    std::cout << "\tCompleted initial NGram count.\n";
+    {
+        size_t n = assignments.size();
+        std::vector<std::tuple<FST<Log, Phoneme>, FST<Log, Phone>,
+            std::string>> fst_assignments(n);
+        for (size_t i = 0; i < n; ++i) {
+            auto [parameter, observation, split] = assignments[i];
+            fst_assignments[i] = std::tuple(
+                    *saved_parameters[parameter],
+                    *saved_observations[observation],
+                    split
+                    );
+        }
+        saved_models[transform] = new auto(count_ngrams(fst_assignments, splits, alignemes, 0, self_align));
+    }
+    std::cout << "\tBuilt initial transform.\n";
 
     dp_file << "method step i sample nlld\n";
     ur_file << "sample form\n";
@@ -786,35 +838,35 @@ void gibbs_fst_dijkstra(
         likelihood_hits = 0;
         likelihood_misses = 0;
 
-        std::cout << "\tStarting step " << step
-            << " with UG=" << ug_weight
-            << " ID=" << ident_weight << ".\n";
-
-        for (size_t i = 0; i < observations.size(); ++i) {
-            // TODO: Jank
-            // if (std::get<Semiring>(uniform.sample(engine, std::monostate())) < Semiring(-std::log(0.1))) {
-            if (true) {
-                Index sample;
-                Semiring sample_p;
-                std::tie(sample, sample_p) = dp.sample(engine, i);
-                dp.update(i, sample);
-                dp_file << "crp " << step << ' ' << i << ' ' << sample << ' '
-                    << sample_p.Value() << '\n';
-            } else {
-                int count = 0;
-                LexiconMap<int, Index> parameters = dp.get_parameters();
-                for (Index parameter_j : parameters) {
-                    if (parameters[i] == parameter_j) { ++count; }
+        std::cout << "\tStarting step " << step << ".\n";
+        // TODO(padril): this is not a good way of doing this
+        size_t skipped = 0;
+        for (size_t assignment = 0; assignment < assignments.size(); ++assignment) {
+            auto [parameter_i, observation_i, split] = assignments[assignment];
+            size_t i = assignment - skipped;
+            if (splits[split].status != Status::Trainable) {
+                ++skipped;
+            } else if (uniform.sample(engine, std::monostate()).first < real_to_log_semiring(mh_ratio)) {
+                // TODO: this probability is jank
+                size_t count = 0;
+                std::vector<ParameterIndex> parameters = dp.get_parameters();
+                for (ParameterIndex parameter_j : parameters) {
+                    if (parameter_i == parameter_j) { ++count; }
                 }
-                Index sample;
-                Semiring sample_p;
-                mh.update(parameters[i]);
-                std::tie(sample, sample_p) = mh.sample(engine, std::pair(i, count));
-                if (parameters[i] != sample) {
+                ParameterIndex sample;
+                Log p;
+                mh.update(parameter_i);
+                std::tie(sample, p) = mh.sample(engine, std::pair(observation_i, count));
+                if (parameter_i != sample) {
                     dp.update(i, sample);
-                    dp_file << "mh " << step << ' ' << i << ' ' << sample
-                        << ' ' << sample_p.Value() << '\n';
+                    dp_file << "mh " << step << ' ' << i << ' ' << size_t(sample)
+                        << ' ' << p.Value() << '\n';
                 }
+            } else {
+                auto [sample, p] = dp.sample(engine, i);
+                dp.update(i, sample);
+                dp_file << "crp " << step << ' ' << size_t(i) << ' ' << size_t(sample) << ' '
+                    << p.Value() << '\n';
             }
         }
 
@@ -824,36 +876,43 @@ void gibbs_fst_dijkstra(
 
         if (step % rebuild_every == rebuild_every - 1) {
             std::cout << "\tRebuilding ngram model\n";
-            fst_parameters.clear();
-            for (Index i : dp.get_parameters()) {
-                fst_parameters.push_back(*saved_fsts[i]);
+            size_t n = assignments.size();
+            std::vector<std::tuple<FST<Log, Phoneme>, FST<Log, Phone>,
+                std::string>> fst_assignments(n);
+            for (size_t i = 0; i < n; ++i) {
+                auto [parameter, observation, split] = assignments[i];
+                fst_assignments[i] = std::tuple(
+                        *saved_parameters[parameter],
+                        *saved_observations[observation],
+                        split
+                        );
             }
-            saved_fsts[ngram] = new FST(ngram_counts(
-                        fst_observations, fst_parameters, ug_counts, alignemes,
-                        ug_weight, ident_weight, self_align));
+            saved_models[transform] = new auto(
+                    count_ngrams(
+                        fst_assignments,
+                        splits,
+                        alignemes,
+                        step,
+                        self_align
+                        ));
             likelihood_cache.clear();
-            compose_cache.clear();
+            parameter_model_compose_cache.clear();
+            model_observation_compose_cache.clear();
 
             std::string fst_out_path = fst_out_dir + "step_"
                 + std::to_string(step) + ".fst";
             // TODO(padril): Do not pickle as a .fst, but rather as an
             //               alignment file (which should be standardized for
             //               the repo).
-            saved_fsts[ngram]->Write(fst_out_path);
+            FST<Log, int> writable;
+            fst::ArcMap(*saved_models[transform], &writable, relabel_to_int<Log, Segment>);
+            writable.Write(fst_out_path);
         }
-        if (step == ug_sched.peak_step) {
-            ug_delta = (ug_sched.boundary - ug_sched.interior) / (steps - step);
-        }
-        if (step == ident_sched.peak_step) {
-            ident_delta = (ident_sched.boundary - ident_sched.interior) / (steps - step);
-        }
-        ug_weight += ug_delta;
-        ident_weight += ident_delta;
     }
 
-    for (Index i = 0; i < static_cast<Index>(saved_fsts.size()); ++i) {
-        Form form = fst_to_form(*saved_fsts[i]);
-        ur_file << i << ' ' << display_form(form, phonemes);
+    for (size_t i = 0; i < saved_parameters.size(); ++i) {
+        std::vector<Phoneme> ur = path_fst_to_labels(*saved_parameters[ParameterIndex(i)]).value();
+        ur_file << size_t(i) << ' ' << labels_to_string(ur, phonemes) << '\n';
     }
 }
 
@@ -869,6 +928,10 @@ int main(int argc, char* argv[]) {
     program.add_argument("--alignments")
         .required()
         .help("the file containing the initial alignment forms. see format "
+              "specification in the README");
+    program.add_argument("--splits")
+        .required()
+        .help("the file containing the information about splits. see format "
               "specification in the README");
 
     // TODO(padril): maybe infer this from the input wordlist
@@ -918,16 +981,12 @@ int main(int argc, char* argv[]) {
         .scan<'g', double>()
         .required()
         .help("the alpha parameter for the dirichlet process");
+    program.add_argument("--mh-ratio")
+        .scan<'g', double>()
+        .required()
+        .help("the ratio of steps to do as a Metropolis Hastings");
 
     // should these be FST only?
-    program.add_argument("--universal-grammar-schedule")
-        .required()
-        .help("how much to value the universal grammar relative to the "
-              "learned phonology");
-    program.add_argument("--identity-grammar-schedule")
-        .required()
-        .help("how much to value the universal grammar relative to the "
-              "learned phonology");
     program.add_argument("--rebuild-stride")
         .scan<'d', size_t>()
         .required()
@@ -961,48 +1020,64 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "Successfully parsed args\n";
-
-    Labelling<Label, Text, Text> phonemes(0, [](Label label){
-            return ++label;
+    Labelling<Phoneme, std::string, std::string> phonemes(
+            0,
+            [](Phoneme label) -> Phoneme {
+                return int(label) + 1;
             });
 
-    // TODO(padril): a better way to force epsilon to be 0 than just doing it
-    //               first.
+    Labelling<Phone, std::string, std::string> phones(
+            Phone(0),
+            [](Phone label) -> Phone {
+                return int(label) + 1;
+            });
+
     std::string epsilon_ident = program.get<std::string>("--epsilon");
-    phonemes.special("epsilon");
+    phonemes.force_special("epsilon", 0);
+    phones.force_special("epsilon", 0);
     if (epsilon_ident != "") {
         phonemes.associate_special("epsilon", epsilon_ident);
+        phones.associate_special("epsilon", epsilon_ident);
     } else {
         phonemes.associate_special("epsilon", "");
+        phones.associate_special("epsilon", "");
     }
     std::string phi_ident = program.get<std::string>("--phi");
     phonemes.special("phi");
+    phones.special("phi");
     if (phi_ident != "") {
         phonemes.associate_special("phi", phi_ident);
+        phones.associate_special("phi", phi_ident);
     } else {
         phonemes.associate_special("phi", "");
+        phones.associate_special("phi", "");
     }
     // TODO(padril): add start and end implicitly if they're unset
     std::string start_ident = program.get<std::string>("--start");
     bool explicit_start;
     phonemes.special("start");
+    phones.special("start");
     if (start_ident != "") {
         explicit_start = true;
         phonemes.associate_special("start", start_ident);
+        phones.associate_special("start", start_ident);
     } else {
         explicit_start = false;
         phonemes.associate_special("start", "");
+        phones.associate_special("start", "");
     }
     std::string end_ident = program.get<std::string>("--end");
     bool explicit_end;
     phonemes.special("end");
+    phones.special("end");
     if (end_ident != "") {
         explicit_end = true;
         phonemes.associate_special("end", end_ident);
+        phones.associate_special("end", end_ident);
     } else {
         explicit_end = false;
         phonemes.associate_special("end", "");
+        phones.associate_special("end", "");
     }
 
     std::string output_deltas_path = program.get<std::string>(
@@ -1015,8 +1090,8 @@ int main(int argc, char* argv[]) {
     // TODO(padril): these should probably be unicode capable
     std::string phonemes_path = program.get<std::string>("--phonemes");
     // TODO(padril): safely handle opening files
-    IFStream phonemes_file(phonemes_path, std::ios_base::in);
-    for (Text line; std::getline(phonemes_file, line);) {
+    std::ifstream phonemes_file(phonemes_path, std::ios_base::in);
+    for (std::string line; std::getline(phonemes_file, line);) {
         // TODO(padril): handle whitespace and blank lines
         phonemes.encode(line);
     }
@@ -1024,10 +1099,10 @@ int main(int argc, char* argv[]) {
     phonemes_file.close();
 
     std::string phones_path = program.get<std::string>("--phones");
-    IFStream phones_file(phonemes_path, std::ios_base::in);
-    for (Text line; std::getline(phones_file, line);) {
+    std::ifstream phones_file(phones_path, std::ios_base::in);
+    for (std::string line; std::getline(phones_file, line);) {
         // TODO(padril): handle whitespace and blank lines
-        phonemes.encode(line);
+        phones.encode(line);
     }
     // TODO(padril): is there a way to defer this?
     phones_file.close();
@@ -1036,52 +1111,38 @@ int main(int argc, char* argv[]) {
     {
         auto s = edit_fst.AddState();
         edit_fst.SetStart(s);
-        edit_fst.SetFinal(s, Semiring::One());
+        edit_fst.SetFinal(s, Log::One());
 
-        for (Label phoneme : phonemes.labels()) {
+        for (Phoneme phoneme : phonemes.labels()) {
             if (phoneme == phonemes.special("phi") ||
                     phoneme == phonemes.special("start") ||
                     phoneme == phonemes.special("end")) { continue; }
-            for (Label phone : phonemes.labels()) {
-            if (phone == phonemes.special("phi") ||
-                    phone == phonemes.special("start") ||
-                    phone == phonemes.special("end")) { continue; }
+            for (Phone phone : phones.labels()) {
+                if (phone == phones.special("phi") ||
+                        phone == phones.special("start") ||
+                        phone == phones.special("end")) { continue; }
                 if (phoneme == phonemes.special("epsilon") &&
-                        phone == phonemes.special("epsilon")) { continue; }
-                edit_fst.AddArc(s, Arc(phoneme, phone, Semiring::One(), s));
+                        phone == phones.special("epsilon")) { continue; }
+                edit_fst.AddArc(s, decltype(edit_fst)::Arc(phoneme, phone, Log::One(), s));
             }
         }
 
-        edit_fst.AddArc(s, Arc(
-                    phonemes.special("start"), phonemes.special("start"),
-                    Semiring::One(), s));
-        edit_fst.AddArc(s, Arc(
-                    phonemes.special("end"), phonemes.special("end"),
-                    Semiring::One(), s));
+        edit_fst.AddArc(s, decltype(edit_fst)::Arc(
+                    phonemes.special("start"), phones.special("start"),
+                    Log::One(), s));
+        edit_fst.AddArc(s, decltype(edit_fst)::Arc(
+                    phonemes.special("end"), phones.special("end"),
+                    Log::One(), s));
 
-        fst::ArcSort(&edit_fst, fst::OLabelCompare<Arc>());
+        fst::ArcSort(&edit_fst, fst::OLabelCompare<decltype(edit_fst)::Arc>());
     }
 
     std::string alignments_path = program.get<std::string>("--alignments");
+    std::string splits_path = program.get<std::string>("--splits");
 
     size_t steps = program.get<size_t>("--steps");
     double alpha = program.get<double>("--alpha");
-
-    std::vector<std::string> ug_schedule_fields = split(
-            program.get<std::string>("--universal-grammar-schedule"), ':');
-    Schedule ug_schedule {
-        .boundary = std::stod(ug_schedule_fields[0]),
-        .interior = std::stod(ug_schedule_fields[1]),
-        .peak_step = std::stoul(ug_schedule_fields[2]),
-    };
-
-    std::vector<std::string> ident_schedule_fields = split(
-            program.get<std::string>("--identity-grammar-schedule"), ':');
-    Schedule ident_schedule {
-        .boundary = std::stod(ident_schedule_fields[0]),
-        .interior = std::stod(ident_schedule_fields[1]),
-        .peak_step = std::stoul(ident_schedule_fields[2]),
-    };
+    double mh_ratio = program.get<double>("--mh-ratio");
 
     size_t rebuild_stride = program.get<size_t>("--rebuild-stride");
 
@@ -1103,162 +1164,106 @@ int main(int argc, char* argv[]) {
     // }
     // transform(0, 0) = 0.3;
 
-    IFStream alignments_file(alignments_path, std::ios_base::in);
-    std::vector<std::pair<Form, Form>> alignments;
-    // TODO(padril): handle quoted CSV reading, probably by using a library
-    Text header;
-    std::getline(alignments_file, header);
-    std::vector<Text> columns = split(header, ',');
-    if (columns != std::vector<Text>({"observation", "parameter", "status", "split"})) {
-        std::cerr << "Alignments file columns not formatted correctly.\n";
-        std::exit(1);
-    }
-    for (Text line; std::getline(alignments_file, line);) {
-        // TODO(padril): This (and isomorphism) is not robust to end of line
-        //               whitespace.
-        std::vector<Text> fields = split(line, ',');
-        Text observation = fields[0];
-        Text parameter = fields[1];
-        Text status = fields[2];
-        if (status == "invisible") {
-            // TODO(padril)
-        } else if (status == "fixed") {
-            // TODO(padril)
-        } else if (status == "trainable") {
-            std::vector<Text> sr_segments = split(observation, ' ');
-            std::vector<Text> ur_segments = split(parameter, ' ');
-            Form sr_values;
-            Form ur_values;
+    // parameter,observation,split
+    std::vector<Alignment> alignments;
+    {
+        std::ifstream alignments_file(alignments_path, std::ios_base::in);
+
+        rapidcsv::Document doc(alignments_file, rapidcsv::LabelParams(0, -1));
+
+        std::vector<std::string> observations = doc.GetColumn<std::string>("observation");
+        std::vector<std::string> parameters = doc.GetColumn<std::string>("parameter");
+        std::vector<std::string> splits = doc.GetColumn<std::string>("split");
+
+        for (size_t i = 0; i < doc.GetRowCount(); ++i) {
+            std::vector<Phoneme> ur;
+            std::vector<Phone> sr;
             if (!explicit_start) {
-                sr_values.push_back(phonemes.special("start"));
-                ur_values.push_back(phonemes.special("start"));
+                ur.push_back(phonemes.special("start"));
+                sr.push_back(phones.special("start"));
             }
-            for (Text segment : sr_segments) {
-                sr_values.push_back(phonemes.encode(segment));
+
+            std::istringstream parameter(parameters[i]);
+            for (std::string segment; getline(parameter, segment, ' ');) {
+                ur.push_back(phonemes.encode(segment));
             }
-            for (Text segment : ur_segments) {
-                ur_values.push_back(phonemes.encode(segment));
+
+            std::istringstream observation(observations[i]);
+            for (std::string segment; getline(observation, segment, ' ');) {
+                sr.push_back(phones.encode(segment));
             }
+
             if (!explicit_end) {
-                sr_values.push_back(phonemes.special("end"));
-                ur_values.push_back(phonemes.special("end"));
+                ur.push_back(phonemes.special("end"));
+                sr.push_back(phones.special("end"));
             }
-            alignments.push_back(std::pair(sr_values, ur_values));
-        } else {
-            std::cerr << "Unknown status in initial alignments.\n";
-            std::exit(1);
+            // TODO(padril): should error when zip has two args of different length
+            alignments.push_back(Alignment {zip(ur, sr), splits[i]});
         }
+        std::cout << "Successfully read alignments file.\n";
     }
-    // TODO(padril): is there a way to defer this?
-    alignments_file.close();
 
-    // std::ofstream phones_out_file("phones_int.txt", std::ios_base::out);
-    // for (Label label : phonemes.labels()) {
-    //     phones_out_file << phonemes.decode(label) << ' ' << label << '\n';
-    // }
-    // phones_out_file.close();
+    // split,status,mix
+    std::unordered_map<std::string, Split> splits;
+    {
+        std::ifstream splits_file(splits_path, std::ios_base::in);
 
+        rapidcsv::Document doc(splits_file, rapidcsv::LabelParams(0, -1));
 
-    std::cout << "Successfully read surfaces file.\n";
+        std::vector<std::string> names = doc.GetColumn<std::string>("split");
+        std::vector<std::string> statuses = doc.GetColumn<std::string>("status");
+        std::vector<std::string> mixes = doc.GetColumn<std::string>("mix");
+        std::vector<std::string> orders = doc.GetColumn<std::string>("order");
 
-    // TODO(padril): loading initial alignments from a file would be nice.
-    // TODO(padril): a more sophisticated way of creating a universal grammar
-    //               would be nice. an old example should be in past commits.
+        for (size_t i = 0; i < doc.GetRowCount(); ++i) {
+            Status status;
+            if (statuses[i] == "invisible") {
+                status = Status::Invisible;
+            } else if (statuses[i] == "fixed") {
+                status = Status::Fixed;
+            } else if (statuses[i] == "trainable") {
+                status = Status::Trainable;
+            } else {
+                std::cerr << "Unknown status in initial alignments.\n";
+                std::exit(1);
+            }
 
-    Labelling<Label, std::pair<Label, Label>, Text> alignemes(
-            0, [](Label label){ return ++label; });
+            char colon_sep;
+            Schedule mix;
+            std::stringstream(mixes[i]) >> mix.boundary
+                >> colon_sep >> mix.interior
+                >> colon_sep >> mix.peak_step;
+
+            splits[names[i]] = { status, mix, std::stoul(orders[i]) };
+        }
+        std::cout << "Successfully read splits file.\n";
+    }
+
+    Labelling<Aligneme, std::pair<Phoneme, Phone>, std::string> alignemes(
+            0,
+            [](Aligneme label) -> Aligneme {
+                return int(label) + 1;
+            });
     // TODO(padril): Move to native FST Symbol maps
     {
+        alignemes.force_special("epsilon", 0);
+        alignemes.associate_special("epsilon",
+                std::pair(phonemes.special("epsilon"), phones.special("epsilon")));
         alignemes.special("phi");
-        auto phi = phonemes.special("phi");
-        alignemes.associate_special("phi", std::pair(phi, phi));
-        alignemes.special("epsilon");
-        auto epsilon = phonemes.special("epsilon");
-        alignemes.associate_special("epsilon", std::pair(epsilon, epsilon));
+        alignemes.associate_special("phi",
+                std::pair(phonemes.special("phi"), phones.special("phi")));
     }
-    NGramFST ug;
-    {
-        FST top;
-        for (Label phoneme : phonemes.labels()) {
-            if (phoneme == phonemes.special("phi") ||
-                    phoneme == phonemes.special("start") ||
-                    phoneme == phonemes.special("end")) {
-                continue;
-            }
-            for (Label phone : phonemes.labels()) {
-                if (phone == phonemes.special("phi") ||
-                        phone == phonemes.special("start") ||
-                        phone == phonemes.special("end")) {
-                    continue;
-                }
-                if (phoneme == phonemes.special("epsilon") &&
-                        phone == phonemes.special("epsilon")) {
-                    continue;
-                }
-                Form ur = Form({
-                        phonemes.special("start"),
-                        phoneme,
-                        phonemes.special("end")});
-                Form sr = Form({
-                        phonemes.special("start"),
-                        phone,
-                        phonemes.special("end")});
-                fst::Union(&top, to_acceptor(alignemes, align_to_fst(ur, sr)));
-            }
-        }
-        fst::RmEpsilon(&top);
-        fst::Determinize(top, &top);
-
-        ngram::NGramCounter<NGramFST::Arc::Weight, Label> counter(1);
-        if (!counter.Count(top)) {
-            std::cerr << "Count n-gram FST (UG) could not be properly "
-                         "computed\n";
-        }
-
-        counter.GetFst(&ug);
-
-        Label backoff_label = alignemes.special("phi");
-        fst::ArcSort(&ug, fst::ILabelCompare<NGramFST::Arc>());
-        ngram::NGramKneserNey make(&ug, false, backoff_label);
-        // TODO(padril): look at the other options of this
-        // TODO(padril): maybe use ngram shrink
-        make.MakeNGramModel();
-    }
-
-    {
-        FST top;
-        for (auto [sr, ur] : alignments) {
-            fst::Union(&top, to_acceptor(alignemes, align_to_fst(ur, sr)));
-        }
-        fst::RmEpsilon(&top);
-        fst::Determinize(top, &top);
-
-        ngram::NGramCounter<NGramFST::Arc::Weight, Label> counter(1);
-        if (!counter.Count(top)) {
-            std::cerr << "Count n-gram FST (UG) could not be properly "
-                         "computed\n";
-        }
-
-        counter.GetFst(&ident_grammar);
-
-        Label backoff_label = alignemes.special("phi");
-        fst::ArcSort(&ident_grammar, fst::ILabelCompare<NGramFST::Arc>());
-        ngram::NGramKneserNey make(&ident_grammar, false, backoff_label);
-        // TODO(padril): look at the other options of this
-        // TODO(padril): maybe use ngram shrink
-        make.MakeNGramModel();
-    }
-
-    std::cout << "Successfully constructed universal grammar.\n";
     std::cout << "Starting Gibbs sampling:\n";
 
     std::ofstream dp_file(output_deltas_path, std::ios_base::out);
     std::ofstream ur_file(output_parameters_path, std::ios_base::out);
     gibbs_fst_dijkstra(
-            steps, engine, alignments, ug, alignemes,
-            phonemes, alpha, ug_schedule, ident_schedule, rebuild_stride,
-            self_align,
-            dp_file, ur_file, output_fsts_dir);
+            steps, engine,
+            alignments, splits,
+            alignemes, phonemes, phones,
+            alpha, rebuild_stride, self_align, mh_ratio,
+            dp_file, ur_file, output_fsts_dir
+            );
 
     std::cout << "Completed Gibbs sampling.\n";
 
