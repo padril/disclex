@@ -7,6 +7,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from Levenshtein import distance
 from typing import Generator, Iterable
+import subprocess
 
 @dataclass
 class Delta:
@@ -18,46 +19,45 @@ class Delta:
 type AssignmentLexicon = dict[str, str]
 type GroupingLexicon = set[tuple[str, str]]
 
-def make_deltas(surfaces_path: Path | str,
-                dp_updates_path: Path | str,
-                ur_indices_path: Path | str) -> tuple[Generator[Delta], int]:
-    surfaces = Path(surfaces_path).open('r').read()
-    surfaces = surfaces.strip().split('\n')
-    sr_dict = {}
-    for i, s in enumerate(surfaces):
-        sr_dict[i] = s.strip().replace(' ', '')
+def make_deltas(alignment_path: Path | str,
+                deltas_path: Path | str,
+                parameters_path: Path | str) -> tuple[Generator[Delta], int]:
+    alignments_raw = Path(alignment_path).open('r').read()
+    alignments_lines = alignments_raw.strip().split('\n')
+    surface_list = [line.split(',')[1] for line in alignments_lines[1:]]
+    surfaces = {}
+    for i, surface in enumerate(surface_list):
+        surfaces[i] = tuple(surface.split(' '))
 
-    ur_indices = Path(ur_indices_path).open('r').read()
-    ur_indices = ur_indices.strip().split('\n')[1:]
-    ur_indices = [f.strip().split() for f in ur_indices]
-    ur_dict = {}
-    for f in ur_indices:
-        if len(f) == 1: f.append('')
-        i, f_ = f
-        ur_dict[int(i)] = f_
+    parameters_raw = Path(parameters_path).open('r').read()
+    parameters_lines = parameters_raw.strip().split('\n')
+    parameters_list = [line.split(',') for line in parameters_lines[1:]]
+    parameters = {}
+    for i, parameter in parameters_list:
+        parameters[int(i)] = tuple(parameter.split(' '))
 
     # we intentionally don't close this so it doesn't go out of scope, and
     # that should be okay since we only leak a single file
-    dp_updates = Path(dp_updates_path).open('r')
-    next(dp_updates)  # remove header
-    counting, yielding = tee(dp_updates)
+    deltas_lines = Path(deltas_path).open('r')
+    next(deltas_lines)  # remove header
+    counting, yielding = tee(deltas_lines)
     n = sum(1 for _ in counting)
     def gen():
         for line in yielding:
-            _, step, sr_idx, ur_idx, nlld = line.strip().split()
+            sample_type, step, sr_idx, ur_idx, nlld = line.split(',')
             yield Delta(int(step),
-                        sr_dict[int(sr_idx)],
-                        ur_dict[int(ur_idx)],
+                        surfaces[int(sr_idx)],
+                        parameters[int(ur_idx)],
                         float(nlld))
     return gen(), n
 
 def parse_assignment_lexicon(file: Path | str) -> AssignmentLexicon:
     file = Path(file)
     lines = file.open().read().strip().split('\n')
+    rows = [line.split(',')[0:2] for line in lines[1:]]
     lex = {}
-    for line in lines:
-        sr, ur = line.strip().split()
-        lex[sr] = ur
+    for ur, sr in rows:
+        lex[tuple(sr.split(' '))] = tuple(ur.split(' '))
     return lex
 
 def tail[T](it: Iterable[T], n: int):
@@ -69,20 +69,10 @@ def write_best_lexicon(deltas: Iterable[Delta], out_path: Path | str):
         if d.observation not in counts:
             counts[d.observation] = Counter()
         counts[d.observation][d.sample] += 1
-    
     out = Path(out_path).open('w')
     for sr, count in counts.items():
         ur, _ = count.most_common()[0]
         print(f'{sr}\t{ur}', file=out)
-
-def initial_assignment_lexicon(surfaces_path: Path | str) -> AssignmentLexicon:
-    surfaces = Path(surfaces_path).open('r').read()
-    surfaces = surfaces.strip().split('\n')
-    lex = {}
-    for line in surfaces:
-        sr = line.strip().replace(' ', '')
-        lex[sr] = sr
-    return lex
 
 def grouping_lexicon(assignments: AssignmentLexicon) -> GroupingLexicon:
     groups = {}
@@ -95,7 +85,9 @@ def grouping_lexicon(assignments: AssignmentLexicon) -> GroupingLexicon:
         lex |= set(combinations(group, 2))
     return lex
 
-def ned(t: str, u: str):
+def ned(t, u):
+    t = [s for s in t if s not in {'<eps>', '<S>', '<E>'}]
+    u = [s for s in u if s not in {'<eps>', '<S>', '<E>'}]
     return distance(t, u) / max(len(t), len(u))
 
 def scores(ref: AssignmentLexicon, hyp: AssignmentLexicon):
@@ -166,7 +158,7 @@ def main(args: list[str]):
     writing, scoring = tee(deltas)
     write_best_lexicon(tail(writing, burnin), 'gibbs_lexicon.tsv')
 
-    hyp = initial_assignment_lexicon(surfaces)
+    hyp = parse_assignment_lexicon(surfaces)
     ref = parse_assignment_lexicon(gold_lexicon)
     hyp = {k: v for k, v in hyp.items() if k in ref}
     ref = {k: v for k, v in ref.items() if k in hyp}
@@ -248,7 +240,106 @@ def main(args: list[str]):
     print(f'\tμ Grouping P = {uparray.mean()} with σ = {uparray.std()}')
     print(f'\tμ Grouping R = {urarray.mean()} with σ = {urarray.std()}')
 
+def main2(args: list[str]):
+    surfaces, models_path, gold_lexicon = args
+    ref = parse_assignment_lexicon(gold_lexicon)
+    models = list(Path(models_path).rglob("*.csv"))
+    burnin = int(0.5 * len(models))
+    ps, rs, fs = {}, {}, {}
+    bps, brs, bfs = {}, {}, {}
+    ups, urs, ufs = {}, {}, {}
+    for model in tqdm(models):
+        step = int(str(model).split('_')[1].split('.')[0])
+        command = [
+            "./build/bin/apply_model",
+            "--observations", surfaces,
+            "--model", str(model),
+            "--splits", "data/splits.txt",
+            "--phones", "data/phones.txt",
+            "--phonemes", "data/phones.txt",
+            "--start", "<S>",
+            "--end", "<E>",
+            "--step", str(step),
+            "--sample",
+            "--output-lexicon", "/tmp/lexicon.tsv"
+            ]
+        subprocess.run(command, capture_output=True)
+        hyp = parse_assignment_lexicon("/tmp/lexicon.tsv")
+        hyp = {k: v for k, v in hyp.items() if k in ref}
+        ref = {k: v for k, v in ref.items() if k in hyp}
+        p, r, f, bp, br, bf = scores(ref, hyp)
+        up, ur, uf = scores_unweighted(grouping_lexicon(ref), grouping_lexicon(hyp))
+        ps[step] = p
+        rs[step] = r
+        fs[step] = f
+        bps[step] = bp
+        brs[step] = br
+        bfs[step] = bf
+        ups[step] = up
+        urs[step] = ur
+        ufs[step] = uf
+
+    ps = [ps[k] for k in sorted(ps)]
+    rs = [rs[k] for k in sorted(rs)]
+    fs = [fs[k] for k in sorted(fs)]
+    bps = [bps[k] for k in sorted(bps)]
+    brs = [brs[k] for k in sorted(brs)]
+    bfs = [bfs[k] for k in sorted(bfs)]
+    ups = [ups[k] for k in sorted(ups)]
+    urs = [urs[k] for k in sorted(urs)]
+    ufs = [ufs[k] for k in sorted(ufs)]
+
+    fig, (ax1, ax2, ax3) = plt.subplots(ncols=3, figsize=(16, 4))
+
+    ax1.plot(ps, label="Precision (WNES)")
+    ax1.plot(rs, label="Recall (iWNES)")
+    ax1.plot(fs, label="F-sore")
+    ax1.set_ylim(-0.05, 1.05)
+
+    lines = ax1.get_lines()
+    labels = [str(line.get_label()) for line in lines]
+    ax1.legend(lines, labels)
+
+    ax2.plot(bps, label="Precision (W≠)")
+    ax2.plot(brs, label="Recall (iW≠)")
+    ax2.plot(bfs, label="F-sore")
+    ax2.set_ylim(-0.05, 1.05)
+
+    lines = ax2.get_lines()
+    labels = [str(line.get_label()) for line in lines]
+    ax2.legend(lines, labels)
+
+    ax3.plot(ups, label="Precision (grouping)")
+    ax3.plot(urs, label="Recall (grouping)")
+    ax3.plot(ufs, label="F-sore")
+    ax3.set_ylim(-0.05, 1.05)
+
+    lines = ax3.get_lines()
+    labels = [str(line.get_label()) for line in lines]
+    ax3.legend(lines, labels)
+
+    fig.savefig("model_prf.svg")
+
+    parray = np.fromiter(tail(ps, burnin), dtype=float)
+    rarray = np.fromiter(tail(rs, burnin), dtype=float)
+    farray = np.fromiter(tail(fs, burnin), dtype=float)
+    print(f'μ NES F = {farray.mean()} with σ = {farray.std()}')
+    print(f'\tμ WNES = {parray.mean()} with σ = {parray.std()}')
+    print(f'\tμ iWNES = {rarray.mean()} with σ = {rarray.std()}')
+    bparray = np.fromiter(tail(bps, burnin), dtype=float)
+    brarray = np.fromiter(tail(brs, burnin), dtype=float)
+    bfarray = np.fromiter(tail(bfs, burnin), dtype=float)
+    print(f'μ ≠ F = {bfarray.mean()} with σ = {bfarray.std()}')
+    print(f'\tμ W≠ = {bparray.mean()} with σ = {bparray.std()}')
+    print(f'\tμ iW≠ = {brarray.mean()} with σ = {brarray.std()}')
+    uparray = np.fromiter(tail(ups, burnin), dtype=float)
+    urarray = np.fromiter(tail(urs, burnin), dtype=float)
+    ufarray = np.fromiter(tail(ufs, burnin), dtype=float)
+    print(f'μ Grouping F = {ufarray.mean()} with σ = {ufarray.std()}')
+    print(f'\tμ Grouping P = {uparray.mean()} with σ = {uparray.std()}')
+    print(f'\tμ Grouping R = {urarray.mean()} with σ = {urarray.std()}')
+
 if __name__ == '__main__':
     import sys
     main(sys.argv[1:])
-    
+

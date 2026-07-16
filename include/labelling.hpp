@@ -16,9 +16,10 @@ private:
     std::unordered_set<Label> forced;
     Label new_label() {
         Label label = curr_label;
-        do {
+        while (forced.find(label) != forced.end()) {
             label = next_label(label);
-        } while (forced.find(label) != forced.end());
+        }
+        curr_label = next_label(label);
         return label;
     }
 public:
@@ -33,20 +34,18 @@ public:
         if (it != map.end()) {
             return it->first;
         }
-        map[curr_label] = base;
-        Label old_label = curr_label;
-        curr_label = new_label();
-        return old_label;
+        Label label = new_label();
+        map[label] = base;
+        return label;
     }
     Label special(const Special& special) {
         auto it = specials.find(special);
         if (it != specials.end()) {
             return it->second;
         }
-        specials[special] = curr_label;
-        Label old_label = curr_label;
-        curr_label = new_label();
-        return old_label;
+        Label label = new_label();
+        specials[special] = label;
+        return label;
     }
     void associate_special(const Special& special, const Base& base) {
         map[specials[special]] = base;

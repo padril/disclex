@@ -10,6 +10,8 @@ def main(phonemes_file, phones_file, out_folder):
         for phoneme in phonemes:
             for phone in phones:
                 print(f'{phoneme},{phone},ug', file=naive)
+        print('<S>,<S>,ug', file=naive)
+        print('<E>,<E>,ug', file=naive)
 
 if __name__ == '__main__':
     import sys
