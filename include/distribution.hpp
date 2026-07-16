@@ -5,6 +5,7 @@
 #include <optional>
 #include <variant>
 #include <random>
+#include <cassert>
 // TODO: Across the board, figure out what to mark as final
 
 namespace distribution {
@@ -218,35 +219,48 @@ public:
 
     std::pair<Parameter, Semiring> sample(Engine& engine, size_t i) override {
         // TODO: Likelihood temperature
-        Semiring r_i = alpha * integrated_likelihood(observations[i]);
+        auto r_i = alpha * integrated_likelihood(observations[i]);
+        auto sum_q_i = Semiring::Zero();
+        std::vector<Semiring> q_i(n);
 
-        Semiring bound = Semiring::Zero();
-        // better than doing a division in the for loop
-        Semiring next = uniform->sample(engine, std::monostate()).first * r_i;
-
-        // NOTE: this is possibly optimizable, since our number of parameters
-        // will be smaller than the number of indices, and we might be able
-        // to store counts and assignments instead
         for (size_t j = 0; j < n; ++j) {
-            if (i == j) { continue; }
-            // We simply make the assumption that if the observation and
-            // parameter are not neighbours, they will have a very low
-            // likelihood. TODO(padril): find justification for this in the
-            // literature.
-            if (!neighbours(observations[i], parameters[j])) { continue; }
-            Semiring q_i_j = likelihood(observations[i], parameters[j]);
-            bound += q_i_j;
-            if (next <= bound) {
-                return std::pair(parameters[j], q_i_j / r_i);
+            if (i == j) {
+                q_i[j] = Semiring::Zero();
+            } else if (!neighbours(observations[i], parameters[j])) {
+                // We make the assumption that if the observation and
+                // parameter are not neighbours, they will have a very low
+                // likelihood. TODO(padril): find justification for this in the
+                // literature.
+                q_i[j] = Semiring::Zero();
+            } else {
+                q_i[j] = likelihood(observations[i], parameters[j]);
+                sum_q_i += q_i[j];
             }
         }
 
-        // NOTE: we can ignore the calculation of b because of this being
-        // essentially an "otherwise", so we don't need to add up to 1
-        Parameter theta;
-        Semiring p;
-        std::tie(theta, p) = prior->sample(engine, observations[i]);
-        return std::pair(theta, p * (Semiring::One() - bound));
+        auto total = sum_q_i + r_i;
+        auto choice = uniform->sample(engine, std::monostate()).first * total;
+
+        auto bound = r_i;
+
+        auto [theta, p_prior] = prior->sample(engine, observations[i]);
+        auto p = p_prior * (r_i / total);
+        if (choice <= bound) {
+            return std::pair(theta, p);
+        }
+        for (size_t j = 0; j < n; ++j) {
+            bound += q_i[j];
+            if (choice <= bound) {
+                theta = parameters[j];
+                p = q_i[j] / total;
+                return std::pair(theta, p);
+            }
+        }
+
+        // It's rare that we reach here, but possible due to the fact that
+        // we underestimate `sum_q_i`. In this case, we just return the
+        // prior.
+        return std::pair(theta, p);
     }
 
     void update(size_t i, Parameter theta) {
