@@ -1,3 +1,4 @@
+#include "external/progress_bar.hpp"
 #include "impl/gibbs_sampler.hpp"
 
 void gibbs_fst_dijkstra(
@@ -24,7 +25,7 @@ void gibbs_fst_dijkstra(
         ObservationIndex observation;
         std::string split;
     };
-    
+
     std::unordered_map<std::string, double> weights;
     for (const auto& [name, split] : splits) {
         weights[name] = split.mix.boundary;
@@ -52,7 +53,7 @@ void gibbs_fst_dijkstra(
         auto observation_fst = labels_to_path_fst<Log, Phone>(observation);
         auto observation_index = ObservationIndex(saved_observations.size());
         saved_observations.push_back(observation_fst);
-        
+
         assignments.push_back(Assignment {
                 parameter_index,
                 observation_index,
@@ -117,9 +118,6 @@ void gibbs_fst_dijkstra(
             return std::pair(std::nullopt, observation);
         });
 
-    int likelihood_hits;
-    int likelihood_misses;
-
     std::vector<std::pair<ObservationIndex, ParameterIndex>> dp_initialization;
     for (auto [parameter, observation, split] : assignments) {
         if (splits[split].status != Status::Invisible) {
@@ -135,10 +133,8 @@ void gibbs_fst_dijkstra(
                 auto it = likelihood_cache.find(
                         std::pair(observation, parameter));
                 if (it != likelihood_cache.end()) {
-                    ++likelihood_hits;
                     return it->second;
                 }
-                ++likelihood_misses;
                 auto p = likelihood(saved_models[transform],
                                     saved_observations[observation],
                                     saved_parameters[parameter]);
@@ -234,10 +230,8 @@ void gibbs_fst_dijkstra(
                 auto [observation, count] = observation_count;
                 auto it = likelihood_cache.find(std::pair(observation, parameter));
                 if (it != likelihood_cache.end()) {
-                    ++likelihood_hits;
                     return it->second;
                 }
-                ++likelihood_misses;
                 Log l = likelihood(
                         saved_models[transform], saved_observations[observation], saved_parameters[parameter]);
                 likelihood_cache[std::pair(observation, parameter)] = l;
@@ -281,16 +275,15 @@ void gibbs_fst_dijkstra(
         transform = ModelIndex(saved_models.size());
         saved_models.push_back(count_ngrams(fst_assignments, splits, alignemes, edit_fst, 0, self_align));
     }
-    std::cout << "\tBuilt initial transform.\n";
 
     dp_file << "method,step,i,sample,nlld\n";
     ur_file << "sample,form\n";
 
-    for (size_t step = 0; step < steps; ++step) {
-        likelihood_hits = 0;
-        likelihood_misses = 0;
+    progress_bar::ProgressBar bar;
+    bar.set_total(steps);
 
-        std::cout << "\tStarting step " << step << ".\n";
+
+    for (size_t step = 0; step < steps; ++step) {
         // TODO(padril): this is not a good way of doing this
         size_t skipped = 0;
         for (size_t assignment = 0; assignment < assignments.size(); ++assignment) {
@@ -321,12 +314,7 @@ void gibbs_fst_dijkstra(
             }
         }
 
-        double hit_ratio = static_cast<double>(likelihood_hits)
-            / (likelihood_hits + likelihood_misses);
-        std::cout << "\t\tLikelihood cache hit ratio : " << hit_ratio << "\n";
-
         if (step % rebuild_every == rebuild_every - 1) {
-            std::cout << "\tRebuilding ngram model\n";
             size_t n = assignments.size();
             std::vector<std::tuple<FST<Log, Phoneme>, FST<Log, Phone>,
                 std::string>> fst_assignments(n);
@@ -365,7 +353,11 @@ void gibbs_fst_dijkstra(
                     << split << "\n";
             };
         }
+
+        bar.advance(1);
     }
+
+    bar.finish();
 
     for (size_t i = 0; i < saved_parameters.size(); ++i) {
         std::vector<Phoneme> ur = path_fst_to_labels(saved_parameters[ParameterIndex(i)]).value();
