@@ -86,7 +86,6 @@ void gibbs_fst_dijkstra(
             &transform,
             [&](Engine& engine, ModelIndex model) -> std::pair<ParameterIndex, Log> {
                 auto [alignment, p] = random_walk(engine, saved_models[model]);
-
                 auto parameter = project_input(alignment);
                 auto parameter_index = ParameterIndex(saved_parameters.size());
                 saved_parameters.push_back(parameter);
@@ -140,11 +139,11 @@ void gibbs_fst_dijkstra(
                     return it->second;
                 }
                 ++likelihood_misses;
-                auto l = likelihood(saved_models[transform],
+                auto p = likelihood(saved_models[transform],
                                     saved_observations[observation],
                                     saved_parameters[parameter]);
-                likelihood_cache[std::pair(observation, parameter)] = l;
-                return l;
+                likelihood_cache[std::pair(observation, parameter)] = p;
+                return p;
             },
             [&](ObservationIndex observation) -> Log {
                 // TODO(padril): cache this as well
@@ -284,8 +283,8 @@ void gibbs_fst_dijkstra(
     }
     std::cout << "\tBuilt initial transform.\n";
 
-    dp_file << "method step i sample nlld\n";
-    ur_file << "sample form\n";
+    dp_file << "method,step,i,sample,nlld\n";
+    ur_file << "sample,form\n";
 
     for (size_t step = 0; step < steps; ++step) {
         likelihood_hits = 0;
