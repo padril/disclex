@@ -15,7 +15,8 @@ std::vector<Alignment> read_model(
         Labelling<Phone, std::string, std::string> phones
         );
 
-std::unordered_map<std::string, Split> read_splits(std::string splits_path);
+std::unordered_map<std::string, Split> read_splits(std::string splits_path,
+                                                   size_t max_step);
 
 #endif  // define READ_MODEL_HPP_
 

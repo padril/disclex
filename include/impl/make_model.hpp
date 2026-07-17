@@ -6,8 +6,6 @@ using namespace semiring;
 #include "impl/fst.hpp"
 #include "impl/segment.hpp"
 
-#include "ngram/ngram.h"
-
 enum class Status {
     Invisible,
     Fixed,
@@ -15,10 +13,8 @@ enum class Status {
 };
 
 struct Schedule {
-    double boundary;
-    double interior;
-    size_t peak_step;
-    size_t end_step;
+    std::vector<std::pair<double, size_t>> points;
+    size_t max_step;
     double at_step(size_t step);
 };
 

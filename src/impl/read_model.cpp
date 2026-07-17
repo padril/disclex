@@ -38,7 +38,8 @@ std::vector<Alignment> read_model(
 }
 
 // split,status,mix
-std::unordered_map<std::string, Split> read_splits(std::string splits_path) {
+std::unordered_map<std::string, Split> read_splits(std::string splits_path,
+                                                   size_t max_step) {
     std::unordered_map<std::string, Split> splits;
     std::ifstream splits_file(splits_path, std::ios_base::in);
 
@@ -62,11 +63,18 @@ std::unordered_map<std::string, Split> read_splits(std::string splits_path) {
             std::exit(1);
         }
 
-        char colon_sep;
         Schedule mix;
-        std::stringstream(mixes[i]) >> mix.boundary
-            >> colon_sep >> mix.interior
-            >> colon_sep >> mix.peak_step;
+        mix.max_step = max_step;
+        mix.points.clear();
+        std::stringstream mix_stream(mixes[i]);
+        for (std::string point; getline(mix_stream, point, ';'); ) {
+            char sep;
+            double value;
+            size_t step;
+            std::stringstream point_stream(point);
+            point_stream >> value >> sep >> step;
+            mix.points.push_back(std::pair(value, step));
+        }
 
         splits[names[i]] = { status, mix, std::stoul(orders[i]) };
     }

@@ -26,11 +26,6 @@ void gibbs_fst_dijkstra(
         std::string split;
     };
 
-    std::unordered_map<std::string, double> weights;
-    for (const auto& [name, split] : splits) {
-        weights[name] = split.mix.boundary;
-   }
-
     // TODO(padril): This gets massive. A custom implementation may be better.
     // TODO(padril): switch to unique_ptr across the repo
     // TODO(padril): several of the new FST(...) new UR(...) new SR(...) lines

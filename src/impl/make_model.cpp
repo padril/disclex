@@ -1,17 +1,27 @@
 #include "impl/make_model.hpp"
+#include <ngram/ngram.h>
 
 double Schedule::at_step(size_t step)  {
-    if (step <= 0) {
-        return boundary;
-    } else if (0 < step && step <= peak_step) {
-        double delta = (interior - boundary) / peak_step;
-        return boundary + delta * step;
-    } else if (peak_step < step && step <= end_step) {
-        double delta = (interior - boundary) / (end_step - peak_step);
-        return interior - delta * (step - peak_step);
-    } else {
-        return boundary;
+    // Start and end values being near zero prevents crashes in some cases
+    double start_value = 0.0001;
+    size_t start_step = 0;
+    double end_value = 0.0001;
+    size_t end_step = max_step;
+    for (auto [point_value, point_step] : points) {
+        if (step == point_step) {
+            return point_value;
+        } else if (step <= point_step && point_step <= end_step) {
+            end_value = point_value;
+            end_step = point_step;
+        } else if (start_step <= point_step && point_step <= step) {
+            start_value = point_value;
+            start_step = point_step;
+        }
     }
+    auto delta_step = end_step - start_step;
+    auto delta_value = end_value - start_value;
+    auto slope = delta_value / delta_step;
+    return start_value + slope * (step - start_step);
 };
 
 
