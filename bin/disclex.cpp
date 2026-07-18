@@ -203,7 +203,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Successfully read alignments file.\n";
 
     // split,status,mix
-    std::unordered_map<std::string, Split> splits = read_splits(splits_path);
+    std::unordered_map<std::string, Split> splits = read_splits(splits_path, steps);
     std::cout << "Successfully read splits file.\n";
 
     Labelling<Aligneme, std::pair<Phoneme, Phone>, std::string> alignemes(

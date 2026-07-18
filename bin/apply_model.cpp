@@ -53,6 +53,9 @@ int main(int argc, char* argv[]) {
     program.add_argument("--step")
         .scan<'d', size_t>()
         .help("what step the model was built on (used for mix portions)");
+    program.add_argument("--max-step")
+        .scan<'d', size_t>()
+        .help("what step the training went up to (used for mix portions)");
     program.add_argument("--seed")
         .scan<'d', size_t>()
         .help("what seed to use for the RNG if any");
@@ -130,6 +133,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> model_paths = program.get<std::vector<std::string>>("--model");
     std::string splits_path = program.get<std::string>("--splits");
 
+    size_t max_step = program.get<size_t>("--max-step");
     size_t step = program.get<size_t>("--step");
 
     // TODO(padril): I don't know if this works
@@ -148,7 +152,7 @@ int main(int argc, char* argv[]) {
             );
     std::cout << "Successfully read model file.\n";
 
-    std::unordered_map<std::string, Split> splits = read_splits(splits_path);
+    std::unordered_map<std::string, Split> splits = read_splits(splits_path, max_step);
     std::cout << "Successfully read splits file.\n";
 
     size_t n = alignments.size();
