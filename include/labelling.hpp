@@ -69,6 +69,8 @@ public:
         for (auto& [label, _] : map) {
             ret.push_back(label);
         }
+        std::sort(ret.begin(), ret.end());
+        ret.erase(std::unique(ret.begin(), ret.end()), ret.end());
         return ret;
     }
 };

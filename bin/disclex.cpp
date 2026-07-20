@@ -41,25 +41,10 @@ int main(int argc, char* argv[]) {
         .help("the file containing the information about splits. see format "
               "specification in the README");
 
-    // TODO(padril): maybe infer this from the input wordlist
-    program.add_argument("--phones")
-        .required()
-        .help("the file containing the list of phones, each on its own line");
-
-    program.add_argument("--phonemes")
-        .required()
-        .help("the file containing the list of phonemes, each on its own "
-              "line");
-
-    // TODO(padril): handle reading these from the phones file
     program.add_argument("--epsilon")
         .default_value("")
         .help("the string identifying epsilon in phone(me) files, if made "
               "explicit");
-    // program.add_argument("--phi")
-    //     .default_value("")
-    //     .help("the string identifying phi in phone(me) files, if made "
-    //           "explicit");
 
     program.add_argument("--geometric-stop-chance")
         .scan<'g', double>()
@@ -159,25 +144,7 @@ int main(int argc, char* argv[]) {
     std::string model_out_dir = program.get<std::string>(
             "--output-models-dir");
     // TODO(padril): safely check that each arg is in a reasonable range
-    // TODO(padril): these should probably be unicode capable
-    std::string phonemes_path = program.get<std::string>("--phonemes");
     // TODO(padril): safely handle opening files
-    std::ifstream phonemes_file(phonemes_path, std::ios_base::in);
-    for (std::string line; std::getline(phonemes_file, line);) {
-        // TODO(padril): handle whitespace and blank lines
-        phonemes.encode(line);
-    }
-    // TODO(padril): is there a way to defer this?
-    phonemes_file.close();
-
-    std::string phones_path = program.get<std::string>("--phones");
-    std::ifstream phones_file(phones_path, std::ios_base::in);
-    for (std::string line; std::getline(phones_file, line);) {
-        // TODO(padril): handle whitespace and blank lines
-        phones.encode(line);
-    }
-    // TODO(padril): is there a way to defer this?
-    phones_file.close();
 
     std::vector<std::string> alignments_paths = program.get<std::vector<std::string>>("--alignments");
     std::string splits_path = program.get<std::string>("--splits");
@@ -211,13 +178,9 @@ int main(int argc, char* argv[]) {
             [](Aligneme label) -> Aligneme {
                 return int(label) + 1;
             });
-    // TODO(padril): Move to native FST Symbol maps
     alignemes.force_special("epsilon", 0);
     alignemes.associate_special("epsilon",
             std::pair(phonemes.special("epsilon"), phones.special("epsilon")));
-    // alignemes.special("phi");
-    // alignemes.associate_special("phi",
-    //         std::pair(phonemes.special("phi"), phones.special("phi")));
     std::cout << "Starting Gibbs sampling:\n";
 
     std::ofstream dp_file(output_deltas_path, std::ios_base::out);

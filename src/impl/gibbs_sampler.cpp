@@ -276,37 +276,35 @@ void gibbs_fst_dijkstra(
 
     progress_bar::ProgressBar bar;
     bar.set_total(steps);
-
+    std::unordered_map<ParameterIndex, size_t> counts;
 
     for (size_t step = 0; step < steps; ++step) {
         // TODO(padril): this is not a good way of doing this
         size_t skipped = 0;
         for (size_t assignment = 0; assignment < assignments.size(); ++assignment) {
-            auto [parameter_i, observation_i, split] = assignments[assignment];
+            auto [parameter, observation, split] = assignments[assignment];
             size_t i = assignment - skipped;
+            ParameterIndex sample;
+            Log p;
+            std::string method;
             if (splits[split].status != Status::Trainable) {
                 ++skipped;
+                continue;
             } else if (uniform.sample(engine, std::monostate()).first < real_to_log_semiring(mh_ratio)) {
-                // TODO: this probability is jank
-                size_t count = 0;
-                std::vector<ParameterIndex> parameters = dp.get_parameters();
-                for (ParameterIndex parameter_j : parameters) {
-                    if (parameter_i == parameter_j) { ++count; }
-                }
-                mh.update(parameter_i);
-                auto [sample, p] = mh.sample(engine, std::pair(observation_i, count));
-                if (parameter_i != sample) {
-                    dp.update(i, sample);
-                    dp_file << "mh," << step << ',' << i << ',' << size_t(sample)
-                        << ',' << p.Value() << '\n';
-                }
+                std::tie(sample, p) = mh.sample(engine, std::pair(observation, counts[parameter]));
+                method = "mh";
             } else {
-                auto [sample, p] = dp.sample(engine, i);
-                dp.update(i, sample);
-                mh.update(sample);
-                dp_file << "crp," << step << ',' << i << ',' << size_t(sample) << ','
-                    << p.Value() << '\n';
+                std::tie(sample, p) = dp.sample(engine, i);
+                method = "crp";
             }
+            dp.update(i, sample);
+            mh.update(sample);
+            auto old = assignments[assignment].parameter;
+            assignments[assignment].parameter = sample;
+            --counts[old];
+            ++counts[sample];
+            dp_file << method << ',' << step << ',' << i << ','
+                << size_t(sample) << ',' << p.Value() << '\n';
         }
 
         if (step % rebuild_every == rebuild_every - 1) {

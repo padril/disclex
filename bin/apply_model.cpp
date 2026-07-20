@@ -23,24 +23,9 @@ int main(int argc, char* argv[]) {
         .help("the file containing the information about splits. see format "
               "specification in the README");
 
-    // TODO(padril): maybe infer this from the input wordlist
-    program.add_argument("--phones")
-        .required()
-        .help("the file containing the list of phones, each on its own line");
-
-    program.add_argument("--phonemes")
-        .required()
-        .help("the file containing the list of phonemes, each on its own "
-              "line");
-
-    // TODO(padril): handle reading these from the phones file
     program.add_argument("--epsilon")
         .default_value("")
         .help("the string identifying epsilon in phone(me) files, if made "
-              "explicit");
-    program.add_argument("--phi")
-        .default_value("")
-        .help("the string identifying phi in phone(me) files, if made "
               "explicit");
 
     bool sample = false;
@@ -85,49 +70,17 @@ int main(int argc, char* argv[]) {
             });
 
     std::string epsilon_ident = program.get<std::string>("--epsilon");
+    if (epsilon_ident == "") { epsilon_ident = "<eps>"; }
     phonemes.force_special("epsilon", 0);
     phones.force_special("epsilon", 0);
-    if (epsilon_ident != "") {
-        phonemes.associate_special("epsilon", epsilon_ident);
-        phones.associate_special("epsilon", epsilon_ident);
-    } else {
-        phonemes.associate_special("epsilon", "<eps>");
-        phones.associate_special("epsilon", "<eps>");
-    }
-    std::string phi_ident = program.get<std::string>("--phi");
-    phonemes.special("phi");
-    phones.special("phi");
-    if (phi_ident != "") {
-        phonemes.associate_special("phi", phi_ident);
-        phones.associate_special("phi", phi_ident);
-    } else {
-        phonemes.associate_special("phi", "<phi>");
-        phones.associate_special("phi", "<phi>");
-    }
+    phonemes.associate_special("epsilon", epsilon_ident);
+    phones.associate_special("epsilon", epsilon_ident);
 
     std::string output_lexicon_path = program.get<std::string>(
             "--output-lexicon");
 
     // TODO(padril): safely check that each arg is in a reasonable range
-    // TODO(padril): these should probably be unicode capable
-    std::string phonemes_path = program.get<std::string>("--phonemes");
     // TODO(padril): safely handle opening files
-    std::ifstream phonemes_file(phonemes_path, std::ios_base::in);
-    for (std::string line; std::getline(phonemes_file, line);) {
-        // TODO(padril): handle whitespace and blank lines
-        phonemes.encode(line);
-    }
-    // TODO(padril): is there a way to defer this?
-    phonemes_file.close();
-
-    std::string phones_path = program.get<std::string>("--phones");
-    std::ifstream phones_file(phones_path, std::ios_base::in);
-    for (std::string line; std::getline(phones_file, line);) {
-        // TODO(padril): handle whitespace and blank lines
-        phones.encode(line);
-    }
-    // TODO(padril): is there a way to defer this?
-    phones_file.close();
 
     std::string observations_path = program.get<std::string>("--observations");
     std::vector<std::string> model_paths = program.get<std::vector<std::string>>("--model");
@@ -150,6 +103,23 @@ int main(int argc, char* argv[]) {
             phonemes,
             phones
             );
+    std::vector<Alignment> observations_alignments = read_model(
+            { observations_path, },
+            phonemes,
+            phones
+            );
+
+    std::cout << "phonemes:";
+    for (auto phoneme : phonemes.labels()) {
+        std::cout << " " << phoneme.v << ":" << phonemes.decode(phoneme);
+    };
+    std::cout << "\n";
+    std::cout << "phones:";
+    for (auto phone : phones.labels()) {
+        std::cout << " " << phone.v << ":" << phones.decode(phone);
+    };
+    std::cout << "\n";
+
     std::cout << "Successfully read model file.\n";
 
     std::unordered_map<std::string, Split> splits = read_splits(splits_path, max_step);
@@ -191,15 +161,9 @@ int main(int argc, char* argv[]) {
             [](Aligneme label) -> Aligneme {
                 return int(label) + 1;
             });
-    // TODO(padril): Move to native FST Symbol maps
-    {
-        alignemes.force_special("epsilon", 0);
-        alignemes.associate_special("epsilon",
-                std::pair(phonemes.special("epsilon"), phones.special("epsilon")));
-        alignemes.special("phi");
-        alignemes.associate_special("phi",
-                std::pair(phonemes.special("phi"), phones.special("phi")));
-    }
+    alignemes.force_special("epsilon", 0);
+    alignemes.associate_special("epsilon",
+            std::pair(phonemes.special("epsilon"), phones.special("epsilon")));
 
     FST<Log, Segment> model = count_ngrams(
             assignments,
@@ -210,15 +174,10 @@ int main(int argc, char* argv[]) {
             );
     std::cout << "Successfully built model.\n";
 
-    std::ifstream observations_file(observations_path, std::ios_base::in);
     std::ofstream lexicon_file(output_lexicon_path, std::ios_base::out);
-    for (std::string observation_string; getline(observations_file, observation_string); ) {
-        std::vector<Phone> observation_labels;
-        std::istringstream observation_stream(observation_string);
-        for (std::string segment; getline(observation_stream, segment, ' ');) {
-            observation_labels.push_back(phones.encode(segment));
-        }
-
+    lexicon_file << "parameter,observation,split\n";
+    for (auto [alignment_labels, split] : observations_alignments ) {
+        std::vector<Phone> observation_labels = unzip(alignment_labels).second;
         auto observation = labels_to_path_fst<Log>(observation_labels);
         auto conditioned = compose(model, observation);
         FST<Log, Segment> path;
@@ -236,12 +195,15 @@ int main(int argc, char* argv[]) {
                     parameter_labels.begin(),
                     parameter_labels.end(),
                     [&](Phoneme x) -> bool {
-                        return x == phonemes.special("phi");
+                        return x == phonemes.special("epsilon");
                     }),
                 parameter_labels.end());
         auto parameter_string = labels_to_string(parameter_labels, phonemes);
+        auto observation_string = labels_to_string(observation_labels, phones);
 
-        lexicon_file << parameter_string << "\t" << observation_string << "\n";
+        lexicon_file << parameter_string << ","
+            << observation_string << ","
+            << split << "\n";
     }
 
     // std::cout << ctrack::result_as_string();

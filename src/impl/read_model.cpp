@@ -3,8 +3,8 @@
 
 std::vector<Alignment> read_model(
         std::vector<std::string> model_paths,
-        Labelling<Phoneme, std::string, std::string> phonemes,
-        Labelling<Phone, std::string, std::string> phones
+        Labelling<Phoneme, std::string, std::string>& phonemes,
+        Labelling<Phone, std::string, std::string>& phones
         ) {
     std::vector<Alignment> alignments;
     for (auto model_path : model_paths) {
@@ -68,11 +68,19 @@ std::unordered_map<std::string, Split> read_splits(std::string splits_path,
         mix.points.clear();
         std::stringstream mix_stream(mixes[i]);
         for (std::string point; getline(mix_stream, point, ';'); ) {
-            char sep;
-            double value;
-            size_t step;
             std::stringstream point_stream(point);
-            point_stream >> value >> sep >> step;
+            std::string value_string, step_string;
+            getline(point_stream, value_string, '@');
+            getline(point_stream, step_string, '@');
+            auto value = std::stod(value_string);
+            size_t step;
+            if (step_string == "start") {
+                step = 0;
+            } else if (step_string == "end") {
+                step = max_step;
+            } else {
+                step = std::stoul(step_string);
+            }
             mix.points.push_back(std::pair(value, step));
         }
 

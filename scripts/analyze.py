@@ -241,9 +241,10 @@ def main(args: list[str]):
     print(f'\tμ Grouping R = {urarray.mean()} with σ = {urarray.std()}')
 
 def main2(args: list[str]):
-    surfaces, models_path, gold_lexicon = args
+    surfaces, models_path, testing_splits, gold_lexicon = args
     ref = parse_assignment_lexicon(gold_lexicon)
     models = list(Path(models_path).rglob("*.csv"))
+    max_step = max(int(model.stem.split('_')[1]) for model in models)
     burnin = int(0.5 * len(models))
     ps, rs, fs = {}, {}, {}
     bps, brs, bfs = {}, {}, {}
@@ -254,17 +255,14 @@ def main2(args: list[str]):
             "./build/bin/apply_model",
             "--observations", surfaces,
             "--model", str(model),
-            "--splits", "data/splits.txt",
-            "--phones", "data/phones.txt",
-            "--phonemes", "data/phones.txt",
-            "--start", "<S>",
-            "--end", "<E>",
+            "--splits", testing_splits,
             "--step", str(step),
+            "--max-step", str(max_step),
             "--sample",
-            "--output-lexicon", "/tmp/lexicon.tsv"
+            "--output-lexicon", "/tmp/lexicon.csv"
             ]
         subprocess.run(command, capture_output=True)
-        hyp = parse_assignment_lexicon("/tmp/lexicon.tsv")
+        hyp = parse_assignment_lexicon("/tmp/lexicon.csv")
         hyp = {k: v for k, v in hyp.items() if k in ref}
         ref = {k: v for k, v in ref.items() if k in hyp}
         p, r, f, bp, br, bf = scores(ref, hyp)
@@ -341,5 +339,5 @@ def main2(args: list[str]):
 
 if __name__ == '__main__':
     import sys
-    main(sys.argv[1:])
+    main2(sys.argv[1:])
 
